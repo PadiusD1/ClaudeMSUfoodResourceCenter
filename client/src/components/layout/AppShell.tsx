@@ -103,13 +103,16 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             </div>
             <div className="flex items-center gap-2">
               <Button
+                asChild
                 variant="outline"
                 size="sm"
                 className="hidden md:inline-flex border-dashed"
                 data-testid="button-export-data-shortcut"
               >
-                <span className="mr-1">Data backup</span>
-                <span className="kbd">Ctrl + E</span>
+                <Link href="/reports" data-testid="link-export-data-shortcut">
+                  <span className="mr-1">Go to reports &amp; export</span>
+                  <span className="kbd">Ctrl + E</span>
+                </Link>
               </Button>
             </div>
           </header>

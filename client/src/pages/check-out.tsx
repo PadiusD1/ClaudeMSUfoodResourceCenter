@@ -40,7 +40,7 @@ export default function CheckOutPage() {
   useEffect(() => {
     if (!cameraOpen) {
       if (readerRef.current) {
-        readerRef.current.reset();
+        (readerRef.current as any).reset?.();
         readerRef.current = null;
       }
       if (videoRef.current && videoRef.current.srcObject) {
@@ -66,7 +66,7 @@ export default function CheckOutPage() {
       });
 
     return () => {
-      reader.reset();
+      (reader as any).reset?.();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [cameraOpen]);
@@ -172,11 +172,23 @@ export default function CheckOutPage() {
 
   function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
-    if (!cart.length) return;
+    if (!cart.length) {
+      toast({
+        title: "No items in cart",
+        description: "Add at least one item before completing check-out.",
+      });
+      return;
+    }
 
     const clientNameFinal = clientName.trim();
     const identifierFinal = clientIdentifier.trim() || clientNameFinal || "Unknown";
-    if (!clientNameFinal) return;
+    if (!clientNameFinal) {
+      toast({
+        title: "Missing client name",
+        description: "Enter the client's name before recording this check-out.",
+      });
+      return;
+    }
 
     // Validate stock
     for (const line of cart) {
@@ -231,12 +243,9 @@ export default function CheckOutPage() {
                 </label>
                 <Select value={clientId} onValueChange={setClientFromId}>
                   <SelectTrigger id="client-select" data-testid="select-client">
-                    <SelectValue placeholder="Select client or choose  bcNew client bd" />
+                    <SelectValue placeholder="Select client or choose New client" />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="" data-testid="option-client-none">
-                       bcSelect client bd
-                    </SelectItem>
                     <SelectItem value="new" data-testid="option-client-new">
                       + New client
                     </SelectItem>
