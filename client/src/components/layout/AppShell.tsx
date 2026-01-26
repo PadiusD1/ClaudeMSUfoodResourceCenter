@@ -1,0 +1,143 @@
+import React from "react";
+import { Link, useLocation } from "wouter";
+import { SidebarProvider, Sidebar, SidebarContent, SidebarGroup, SidebarGroupLabel, SidebarHeader, SidebarInset, SidebarMenu, SidebarMenuButton, SidebarMenuItem, SidebarRail, SidebarSeparator, SidebarTrigger } from "@/components/ui/sidebar";
+import { Card } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { cn } from "@/lib/utils";
+import { BoxesIcon, ClipboardListIcon, FileTextIcon, HistoryIcon, HomeIcon, PackageIcon, ShoppingCartIcon, UsersIcon } from "lucide-react";
+
+const navItems = [
+  { href: "/", label: "Dashboard", icon: HomeIcon, testId: "nav-dashboard" },
+  { href: "/inventory", label: "Inventory", icon: BoxesIcon, testId: "nav-inventory" },
+  { href: "/check-in", label: "Check-In", icon: ClipboardListIcon, testId: "nav-check-in" },
+  { href: "/check-out", label: "Check-Out", icon: ShoppingCartIcon, testId: "nav-check-out" },
+  { href: "/clients", label: "Clients", icon: UsersIcon, testId: "nav-clients" },
+  { href: "/reports", label: "Reports", icon: FileTextIcon, testId: "nav-reports" },
+  { href: "/activity", label: "Activity / History", icon: HistoryIcon, testId: "nav-activity" },
+];
+
+export function AppShell({ children }: { children: React.ReactNode }) {
+  const [location] = useLocation();
+
+  return (
+    <SidebarProvider className="app-shell">
+      <Sidebar collapsible="icon" variant="inset" className="border-r border-sidebar-border/80">
+        <SidebarHeader className="pt-3 pb-1 px-3">
+          <div className="flex items-center gap-3">
+            <div
+              className="flex h-9 w-9 items-center justify-center rounded-lg border border-sidebar-border bg-sidebar-foreground/5 text-sidebar-foreground shadow-sm text-xs font-semibold tracking-tight"
+              data-testid="img-logo-placeholder"
+            >
+              FRC
+            </div>
+            <div className="flex flex-col min-w-0">
+              <span className="text-sm font-semibold tracking-tight leading-tight" data-testid="text-app-title">
+                Morgan State Repository
+              </span>
+              <span className="text-[11px] text-sidebar-foreground/70" data-testid="text-app-tagline">
+                Food Pantry Inventory System
+              </span>
+            </div>
+            <div className="ml-auto flex items-center gap-1">
+              <SidebarTrigger data-testid="button-toggle-sidebar" />
+            </div>
+          </div>
+        </SidebarHeader>
+        <SidebarSeparator />
+        <SidebarContent>
+          <SidebarGroup>
+            <SidebarGroupLabel className="uppercase tracking-[0.16em] text-[10px] text-sidebar-foreground/60">
+              Modules
+            </SidebarGroupLabel>
+            <SidebarMenu>
+              {navItems.map((item) => {
+                const Icon = item.icon;
+                const active = location === item.href;
+                return (
+                  <SidebarMenuItem key={item.href}>
+                    <SidebarMenuButton
+                      asChild
+                      isActive={active}
+                      data-testid={item.testId}
+                    >
+                      <Link href={item.href} data-testid={`link-${item.label.toLowerCase().replace(/\s+/g, "-")}`}>
+                        <Icon className="shrink-0" />
+                        <span>{item.label}</span>
+                      </Link>
+                    </SidebarMenuButton>
+                  </SidebarMenuItem>
+                );
+              })}
+            </SidebarMenu>
+          </SidebarGroup>
+          <div className="mt-auto p-3 pt-1">
+            <Card className="glass-panel border-dashed border-sidebar-border/70 px-3 py-2.5">
+              <div className="flex items-start justify-between gap-3">
+                <div className="space-y-0.5">
+                  <p className="text-xs font-medium text-sidebar-foreground/80" data-testid="text-storage-mode-heading">
+                    Local-only workspace
+                  </p>
+                  <p className="text-[11px] text-sidebar-foreground/65" data-testid="text-storage-mode-description">
+                    All pantry data is stored in this browser. Clearing site data will wipe this repository.
+                  </p>
+                </div>
+              </div>
+            </Card>
+          </div>
+        </SidebarContent>
+        <SidebarRail />
+      </Sidebar>
+      <SidebarInset className="relative overflow-hidden">
+        <div className="mx-auto flex h-full w-full max-w-6xl flex-col gap-4 px-4 pb-8 pt-4 md:px-6">
+          <header className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
+            <div className="space-y-1">
+              <h1
+                className="text-2xl md:text-3xl font-semibold tracking-tight text-foreground flex items-center gap-2"
+                data-testid="text-page-title"
+              >
+                {pageTitleForPath(location)}
+              </h1>
+              <p className="text-sm text-muted-foreground" data-testid="text-page-subtitle">
+                {pageSubtitleForPath(location)}
+              </p>
+            </div>
+            <div className="flex items-center gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                className="hidden md:inline-flex border-dashed"
+                data-testid="button-export-data-shortcut"
+              >
+                <span className="mr-1">Data backup</span>
+                <span className="kbd">Ctrl + E</span>
+              </Button>
+            </div>
+          </header>
+          <main className="flex-1 min-h-0">
+            {children}
+          </main>
+        </div>
+      </SidebarInset>
+    </SidebarProvider>
+  );
+}
+
+function pageTitleForPath(path: string) {
+  if (path.startsWith("/inventory")) return "Inventory";
+  if (path.startsWith("/check-in")) return "Check-In (Receiving)";
+  if (path.startsWith("/check-out")) return "Check-Out (Distribution)";
+  if (path.startsWith("/clients")) return "Clients";
+  if (path.startsWith("/reports")) return "Reports";
+  if (path.startsWith("/activity")) return "Activity & History";
+  return "Dashboard";
+}
+
+function pageSubtitleForPath(path: string) {
+  if (path.startsWith("/inventory")) return "Manage product catalog, quantities, categories, and barcodes.";
+  if (path.startsWith("/check-in")) return "Receive new product into inventory and log sources.";
+  if (path.startsWith("/check-out")) return "Build distribution carts, track visits, and decrement stock.";
+  if (path.startsWith("/clients")) return "Maintain client records and visit history with gentle frequency checks.";
+  if (path.startsWith("/reports")) return "Generate inventory and distribution summaries for any date range.";
+  if (path.startsWith("/activity")) return "Browse and filter the full transaction log across IN and OUT moves.";
+  return "At-a-glance overview of pantry stock, clients, and activity.";
+}
