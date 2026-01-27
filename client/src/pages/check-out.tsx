@@ -220,7 +220,7 @@ export default function CheckOutPage() {
                     </SelectItem>
                     {sortedClients.map((c) => (
                       <SelectItem key={c.id} value={c.id} data-testid={`option-client-${c.id}`}>
-                        {c.name}  b7 {c.identifier}
+                        {c.name} • {c.identifier}
                       </SelectItem>
                     ))}
                   </SelectContent>
@@ -275,7 +275,7 @@ export default function CheckOutPage() {
                     <SelectContent>
                       {sortedInventory.map((i) => (
                         <SelectItem key={i.id} value={i.id} data-testid={`option-cart-item-${i.id}`}>
-                          {i.name}  b7 {i.quantity} on hand
+                          {i.name} • {i.quantity} on hand
                         </SelectItem>
                       ))}
                     </SelectContent>

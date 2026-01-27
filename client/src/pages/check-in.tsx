@@ -230,7 +230,7 @@ export default function CheckInPage() {
                 <SelectContent>
                   {sortedInventory.map((item) => (
                     <SelectItem key={item.id} value={item.id} data-testid={`option-existing-item-${item.id}`}>
-                      {item.name}  b7 {item.quantity} on hand
+                      {item.name} • {item.quantity} on hand
                     </SelectItem>
                   ))}
                 </SelectContent>
