@@ -1,14 +1,12 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
-import { useRepository } from "@/lib/repository";
+import React, { useMemo, useState, useRef } from "react";
+import { useRepository, getCurrentLocation } from "@/lib/repository";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { useToast } from "@/hooks/use-toast";
-import { BrowserMultiFormatReader } from "@zxing/browser";
-import { CameraIcon, ShoppingCartIcon } from "lucide-react";
+import { ShoppingCartIcon } from "lucide-react";
 
 export default function CheckOutPage() {
   const { inventory, clients, recordOutbound, barcodeCache, upsertBarcodeCache, addOrUpdateItem } =
@@ -22,10 +20,7 @@ export default function CheckOutPage() {
 
   const [cart, setCart] = useState<{ itemId: string; quantity: number }[]>([]);
   const [barcode, setBarcode] = useState("");
-
-  const [cameraOpen, setCameraOpen] = useState(false);
-  const videoRef = useRef<HTMLVideoElement | null>(null);
-  const readerRef = useRef<BrowserMultiFormatReader | null>(null);
+  const barcodeInputRef = useRef<HTMLInputElement>(null);
 
   const sortedClients = useMemo(
     () => [...clients].sort((a, b) => a.name.localeCompare(b.name)),
@@ -36,40 +31,6 @@ export default function CheckOutPage() {
     () => [...inventory].sort((a, b) => a.name.localeCompare(b.name)),
     [inventory],
   );
-
-  useEffect(() => {
-    if (!cameraOpen) {
-      if (readerRef.current) {
-        (readerRef.current as any).reset?.();
-        readerRef.current = null;
-      }
-      if (videoRef.current && videoRef.current.srcObject) {
-        const tracks = (videoRef.current.srcObject as MediaStream).getTracks();
-        tracks.forEach((t) => t.stop());
-        videoRef.current.srcObject = null;
-      }
-      return;
-    }
-
-    const reader = new BrowserMultiFormatReader();
-    readerRef.current = reader;
-
-    reader
-      .decodeFromVideoDevice(undefined, videoRef.current!, (result, err) => {
-        if (result) {
-          const text = result.getText();
-          handleBarcodeScanned(text);
-        }
-      })
-      .catch(() => {
-        // ignore camera errors for now
-      });
-
-    return () => {
-      (reader as any).reset?.();
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cameraOpen]);
 
   function setClientFromId(id: string) {
     setClientId(id);
@@ -100,10 +61,52 @@ export default function CheckOutPage() {
     });
   }
 
-  function handleBarcodeScanned(code: string) {
+  async function handleBarcodeScanned(code: string) {
     const trimmed = code.trim();
     if (!trimmed) return;
 
+    // 1. Global Lookup First (per requirements)
+    try {
+      const res = await fetch(`https://world.openfoodfacts.org/api/v0/product/${trimmed}.json`);
+      if (res.ok) {
+        const data = await res.json();
+        if (data.status === 1) {
+          const p = data.product;
+          const name = p.product_name || p.generic_name || "";
+          const category = (Array.isArray(p.categories_tags) && p.categories_tags[0]?.split(":").pop()) || "Uncategorized";
+          const grams = p.product_quantity && p.product_quantity_unit === "g" ? Number(p.product_quantity) : undefined;
+          const weight = grams && !isNaN(grams) ? grams / 453.592 : 0;
+
+          // Check if we already have this item locally to avoid duplicate creation?
+          // Requirement says "do not overwrite existing locally edited items unless the item is new"
+          // We should check if an item with this barcode exists.
+          const existing = inventory.find((i) => i.barcode === trimmed);
+          if (existing) {
+             // Found locally, add to cart
+             addToCart(existing.id, 1);
+             toast({ title: "Item added", description: `${existing.name} added via global scan.` });
+             return;
+          }
+
+          // Not found locally, create it from global data
+          upsertBarcodeCache(trimmed, { name, category, weightPerUnitLbs: weight });
+          const item = addOrUpdateItem({
+            name: name || "Unknown Item",
+            category: category,
+            barcode: trimmed,
+            quantity: 0, // Initial quantity 0 when discovered at checkout? Or should we prompt? usually 0.
+            weightPerUnitLbs: weight,
+          });
+          addToCart(item.id, 1);
+          toast({ title: "New item found", description: `${item.name} added from global database.` });
+          return;
+        }
+      }
+    } catch {
+      // Ignore network errors
+    }
+
+    // 2. Local Inventory Fallback
     const existing = inventory.find((i) => i.barcode === trimmed);
     if (existing) {
       addToCart(existing.id, 1);
@@ -111,6 +114,7 @@ export default function CheckOutPage() {
       return;
     }
 
+    // 3. Local Cache Fallback
     const cached = barcodeCache[trimmed];
     if (cached && cached.name) {
       const item = addOrUpdateItem({
@@ -125,52 +129,14 @@ export default function CheckOutPage() {
       return;
     }
 
-    fetchFromOpenFoodFacts(trimmed)
-      .then((entry) => {
-        if (!entry.name) {
-          toast({
-            title: "Barcode not found",
-            description: "No product info was returned. You can create the item manually.",
-          });
-          return;
-        }
-        upsertBarcodeCache(trimmed, entry);
-        const item = addOrUpdateItem({
-          name: entry.name,
-          category: entry.category ?? "Uncategorized",
-          barcode: trimmed,
-          quantity: 0,
-          weightPerUnitLbs: entry.weightPerUnitLbs ?? 0,
-        });
-        addToCart(item.id, 1);
-        toast({ title: "New item from Open Food Facts", description: `${item.name} added via scan.` });
-      })
-      .catch(() => {
-        toast({
-          title: "Barcode lookup failed",
-          description: "We could not reach Open Food Facts. Add the item manually instead.",
-        });
-      });
+    // 4. Not found
+    toast({
+      title: "Barcode not found",
+      description: "Item not in global or local database. Please add it in Inventory.",
+    });
   }
 
-  async function fetchFromOpenFoodFacts(barcode: string) {
-    const res = await fetch(`https://world.openfoodfacts.org/api/v0/product/${barcode}.json`);
-    if (!res.ok) throw new Error("network");
-    const data = await res.json();
-    if (data.status !== 1) return {} as any;
-    const p = data.product;
-    const name: string | undefined = p.product_name || p.generic_name || undefined;
-    const category: string | undefined =
-      (Array.isArray(p.categories_tags) && p.categories_tags[0]?.split(":").pop()) || undefined;
-    const weightPerUnitLbs: number | undefined = (() => {
-      const grams = p.product_quantity && p.product_quantity_unit === "g" ? Number(p.product_quantity) : undefined;
-      if (!grams || isNaN(grams)) return undefined;
-      return grams / 453.592;
-    })();
-    return { name, category, weightPerUnitLbs };
-  }
-
-  function handleSubmit(e: React.FormEvent) {
+  async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     if (!cart.length) {
       toast({
@@ -203,6 +169,8 @@ export default function CheckOutPage() {
       }
     }
 
+    const location = await getCurrentLocation();
+
     const result = recordOutbound({
       client: {
         id: clientId && clientId !== "new" ? clientId : undefined,
@@ -211,12 +179,13 @@ export default function CheckOutPage() {
         contact: clientContact.trim() || undefined,
       },
       items: cart,
+      location,
     });
 
     if (result?.client) {
       toast({
         title: "Check-out recorded",
-        description: `Distribution recorded for ${result.client.name}.`,
+        description: `Distribution recorded for ${result.client.name}${location ? " with location" : ""}.`,
       });
       setCart([]);
       setClientFromId(result.client.id);
@@ -313,8 +282,9 @@ export default function CheckOutPage() {
                   </Select>
                   <div className="flex gap-2">
                     <Input
+                      ref={barcodeInputRef}
                       type="text"
-                      placeholder="Scan or type barcode"
+                      placeholder="Scan barcode"
                       value={barcode}
                       onChange={(e) => setBarcode(e.target.value)}
                       onKeyDown={(e) => {
@@ -327,40 +297,12 @@ export default function CheckOutPage() {
                         }
                       }}
                       className="w-40"
+                      autoFocus
                       data-testid="input-barcode"
                     />
-                    <Dialog open={cameraOpen} onOpenChange={setCameraOpen}>
-                      <DialogTrigger asChild>
-                        <Button
-                          type="button"
-                          variant="outline"
-                          size="icon"
-                          data-testid="button-open-camera-scanner"
-                        >
-                          <CameraIcon className="h-4 w-4" />
-                        </Button>
-                      </DialogTrigger>
-                      <DialogContent className="max-w-md" data-testid="dialog-camera-scanner">
-                        <DialogHeader>
-                          <DialogTitle>Scan barcode with camera</DialogTitle>
-                        </DialogHeader>
-                        <div className="aspect-video rounded-md overflow-hidden bg-muted flex items-center justify-center">
-                          <video
-                            ref={videoRef}
-                            className="w-full h-full object-cover"
-                            autoPlay
-                            muted
-                            playsInline
-                            data-testid="video-barcode-camera"
-                          />
-                        </div>
-                        <p className="mt-2 text-[11px] text-muted-foreground" data-testid="text-camera-scanner-help">
-                          Point the barcode at the camera. Successful scans will add the item to the cart.
-                        </p>
-                      </DialogContent>
-                    </Dialog>
                   </div>
                 </div>
+                <p className="text-[10px] text-muted-foreground">USB Scanner: Focus scan field and Enter.</p>
               </div>
 
               <CartTable cart={cart} setCart={setCart} />

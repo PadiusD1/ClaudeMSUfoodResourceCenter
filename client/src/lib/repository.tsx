@@ -33,6 +33,12 @@ export type TransactionItem = {
 
 export type TransactionType = "IN" | "OUT";
 
+export type GeoLocation = {
+  latitude: number;
+  longitude: number;
+  accuracy?: number;
+};
+
 export type Transaction = {
   id: string;
   type: TransactionType;
@@ -41,6 +47,7 @@ export type Transaction = {
   source?: string;
   clientId?: string;
   clientName?: string;
+  location?: GeoLocation;
 };
 
 export type Settings = {
@@ -109,11 +116,13 @@ export type RepositoryContextValue = RepositoryState & {
     quantity: number;
     source?: string;
     timestamp?: string;
+    location?: GeoLocation;
   }) => void;
   recordOutbound: (options: {
     client: { id?: string; name: string; identifier: string; contact?: string };
     items: { itemId: string; quantity: number }[];
     timestamp?: string;
+    location?: GeoLocation;
   }) => { client: ClientRecord } | undefined;
   upsertClient: (partial: Partial<ClientRecord> & { name: string; identifier: string }) => ClientRecord;
   updateSettings: (partial: Partial<Settings>) => void;
@@ -216,8 +225,9 @@ export function RepositoryProvider({ children }: { children: React.ReactNode }) 
       quantity: number;
       source?: string;
       timestamp?: string;
+      location?: GeoLocation;
     }) {
-      const { itemId, quantity, source } = options;
+      const { itemId, quantity, source, location } = options;
       const timestamp = options.timestamp ?? new Date().toISOString();
 
       if (!quantity || quantity <= 0) return;
@@ -246,6 +256,7 @@ export function RepositoryProvider({ children }: { children: React.ReactNode }) 
             },
           ],
           source,
+          location,
         };
 
         return {
@@ -260,6 +271,7 @@ export function RepositoryProvider({ children }: { children: React.ReactNode }) 
       client: { id?: string; name: string; identifier: string; contact?: string };
       items: { itemId: string; quantity: number }[];
       timestamp?: string;
+      location?: GeoLocation;
     }): { client: ClientRecord } | undefined {
       const timestamp = options.timestamp ?? new Date().toISOString();
 
@@ -306,6 +318,7 @@ export function RepositoryProvider({ children }: { children: React.ReactNode }) 
           clientId: client.id,
           clientName: client.name,
           items: txItems,
+          location: options.location,
         };
 
         return {
@@ -376,4 +389,23 @@ export function useInventorySummary() {
 export function isLowStock(item: InventoryItem): boolean {
   if (item.reorderThreshold == null) return false;
   return item.quantity <= item.reorderThreshold;
+}
+
+export async function getCurrentLocation(): Promise<GeoLocation | undefined> {
+  if (!navigator.geolocation) return undefined;
+  try {
+    const pos = await new Promise<GeolocationPosition>((resolve, reject) => {
+      navigator.geolocation.getCurrentPosition(resolve, reject, {
+        timeout: 5000,
+        enableHighAccuracy: true,
+      });
+    });
+    return {
+      latitude: pos.coords.latitude,
+      longitude: pos.coords.longitude,
+      accuracy: pos.coords.accuracy,
+    };
+  } catch {
+    return undefined;
+  }
 }

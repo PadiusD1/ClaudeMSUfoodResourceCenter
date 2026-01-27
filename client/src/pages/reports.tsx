@@ -70,8 +70,12 @@ export default function ReportsPage() {
 
   function exportCsv() {
     const rows: string[] = [];
-    rows.push("type,timestamp,client,clientIdentifier,itemName,quantity,weightPerUnitLbs,valuePerUnitUsd");
+    rows.push("type,timestamp,latitude,longitude,accuracy,client,clientIdentifier,itemName,quantity,weightPerUnitLbs,valuePerUnitUsd");
     for (const tx of repo.transactions) {
+      const lat = tx.location?.latitude ?? "";
+      const long = tx.location?.longitude ?? "";
+      const acc = tx.location?.accuracy ?? "";
+      
       for (const item of tx.items) {
         const client = tx.clientName ?? "";
         const clientRecord = tx.clientId ? repo.clients.find((c) => c.id === tx.clientId) : undefined;
@@ -80,6 +84,9 @@ export default function ReportsPage() {
           [
             tx.type,
             tx.timestamp,
+            lat,
+            long,
+            acc,
             escapeCsv(client),
             escapeCsv(identifier),
             escapeCsv(item.name),
