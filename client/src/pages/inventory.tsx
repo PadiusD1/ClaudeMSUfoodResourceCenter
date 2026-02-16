@@ -8,10 +8,10 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 import { useToast } from "@/hooks/use-toast";
 import { Badge } from "@/components/ui/badge";
-import { PencilIcon, PlusIcon, SearchIcon } from "lucide-react";
+import { PencilIcon, PlusIcon, SearchIcon, XIcon } from "lucide-react";
 
 export default function InventoryPage() {
-  const { inventory, addOrUpdateItem, adjustItemQuantity, recordInbound, upsertBarcodeCache, barcodeCache } = useRepository();
+  const { inventory, addOrUpdateItem, adjustItemQuantity, recordInbound, upsertBarcodeCache, barcodeCache, sources, donors, addSource, addDonor } = useRepository();
   const { toast } = useToast();
   const [query, setQuery] = useState("");
   const [categoryFilter, setCategoryFilter] = useState<string | "all">("all");
@@ -38,16 +38,20 @@ export default function InventoryPage() {
     [inventory, query, categoryFilter],
   );
 
-  async function handleSave(form: Partial<InventoryItem> & { name: string; initialQuantity?: number; source?: string }) {
+  async function handleSave(form: Partial<InventoryItem> & { name: string; initialQuantity?: number; source?: string; donor?: string }) {
     const item = addOrUpdateItem(form);
     
     // If it's a new item (implied if we pass initialQuantity > 0)
     if (form.initialQuantity && form.initialQuantity > 0) {
+      if (form.source) addSource(form.source);
+      if (form.donor && form.source === "Donation") addDonor(form.donor);
+
       const location = await getCurrentLocation();
       recordInbound({
         itemId: item.id,
         quantity: form.initialQuantity,
         source: form.source,
+        donor: form.donor,
         location
       });
       toast({
@@ -111,6 +115,7 @@ export default function InventoryPage() {
                   quantity: 0,
                   weightPerUnitLbs: 0,
                   valuePerUnitUsd: 0,
+                  allergens: [],
                   createdAt: "",
                   updatedAt: "",
                 })}
@@ -127,6 +132,8 @@ export default function InventoryPage() {
                 onSave={handleSave}
                 upsertBarcodeCache={upsertBarcodeCache}
                 barcodeCache={barcodeCache}
+                sources={sources}
+                donors={donors}
               />
             )}
           </Dialog>
@@ -245,13 +252,17 @@ function InventoryEditDialog({
   onCancel,
   onSave,
   upsertBarcodeCache,
-  barcodeCache
+  barcodeCache,
+  sources,
+  donors
 }: {
   item: InventoryItem;
   onCancel: () => void;
-  onSave: (item: Partial<InventoryItem> & { name: string; initialQuantity?: number; source?: string }) => void;
+  onSave: (item: Partial<InventoryItem> & { name: string; initialQuantity?: number; source?: string; donor?: string }) => void;
   upsertBarcodeCache: any;
   barcodeCache: any;
+  sources: string[];
+  donors: string[];
 }) {
   const isNew = !item.id;
   const [form, setForm] = useState({
@@ -263,10 +274,14 @@ function InventoryEditDialog({
     weightPerUnitLbs: item.weightPerUnitLbs,
     valuePerUnitUsd: item.valuePerUnitUsd,
     reorderThreshold: item.reorderThreshold ?? undefined,
+    allergens: item.allergens || [] as string[],
     // extra fields for new item check-in
     initialQuantity: 0,
-    source: ""
+    source: "",
+    donor: ""
   });
+  const [isNewSource, setIsNewSource] = useState(false);
+  const [isNewDonor, setIsNewDonor] = useState(false);
   const { toast } = useToast();
 
   async function handleBarcodeLookup(code: string) {
@@ -281,14 +296,16 @@ function InventoryEditDialog({
           const category = (Array.isArray(p.categories_tags) && p.categories_tags[0]?.split(":").pop()) || "Uncategorized";
           const grams = p.product_quantity && p.product_quantity_unit === "g" ? Number(p.product_quantity) : undefined;
           const weight = grams && !isNaN(grams) ? grams / 453.592 : 0;
+          const allergens = (p.allergens_tags || []).map((a: string) => a.split(":").pop()?.replace(/-/g, " ") || a);
 
           setForm(prev => ({
             ...prev,
             name: name || prev.name,
             category: category || prev.category,
-            weightPerUnitLbs: weight || prev.weightPerUnitLbs
+            weightPerUnitLbs: weight || prev.weightPerUnitLbs,
+            allergens: allergens.length ? allergens : prev.allergens
           }));
-          upsertBarcodeCache(code, { name, category, weightPerUnitLbs: weight });
+          upsertBarcodeCache(code, { name, category, weightPerUnitLbs: weight, allergens });
           toast({ title: "Product found", description: "Prefilled details from global database." });
           return;
         }
@@ -301,7 +318,8 @@ function InventoryEditDialog({
         ...prev,
         name: cached.name || prev.name,
         category: cached.category || prev.category,
-        weightPerUnitLbs: cached.weightPerUnitLbs || prev.weightPerUnitLbs
+        weightPerUnitLbs: cached.weightPerUnitLbs || prev.weightPerUnitLbs,
+        allergens: cached.allergens || prev.allergens
       }));
       toast({ title: "Cache found", description: "Prefilled details from local cache." });
     }
@@ -319,6 +337,8 @@ function InventoryEditDialog({
       name: form.name.trim(),
       category: form.category.trim() || "Uncategorized",
       barcode: form.barcode?.trim() || undefined,
+      source: form.source.trim() || undefined,
+      donor: form.donor.trim() || undefined,
     });
   }
 
@@ -409,9 +429,45 @@ function InventoryEditDialog({
           </div>
         </div>
 
+        <div className="space-y-1.5">
+            <label className="text-sm font-medium" htmlFor="item-allergens">
+              Allergens
+            </label>
+            <div className="flex flex-wrap gap-2 mb-2 p-2 border rounded-md min-h-[40px]">
+              {form.allergens.map((allergen, idx) => (
+                <Badge key={idx} variant="secondary" className="gap-1">
+                  {allergen}
+                  <button
+                    type="button"
+                    onClick={() => setForm(p => ({...p, allergens: p.allergens.filter((_, i) => i !== idx)}))}
+                    className="hover:text-destructive"
+                  >
+                    <XIcon className="h-3 w-3" />
+                  </button>
+                </Badge>
+              ))}
+              <Input
+                type="text"
+                className="border-none shadow-none focus-visible:ring-0 h-6 p-0 w-32 min-w-[80px]"
+                placeholder="Add allergen..."
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault();
+                    const val = e.currentTarget.value.trim();
+                    if (val && !form.allergens.includes(val)) {
+                      setForm(p => ({...p, allergens: [...p.allergens, val]}));
+                      e.currentTarget.value = '';
+                    }
+                  }
+                }}
+              />
+            </div>
+            <p className="text-[11px] text-muted-foreground">Type allergen and press Enter to add. Auto-filled from scan if found.</p>
+        </div>
+
         {isNew ? (
           // For new items, allow setting initial quantity and source
-          <div className="grid gap-3 md:grid-cols-2 pt-2 border-t border-dashed">
+          <div className="grid gap-3 pt-2 border-t border-dashed">
             <div className="space-y-1.5">
               <label className="text-sm font-medium" htmlFor="initial-quantity">
                 Initial Quantity
@@ -427,15 +483,86 @@ function InventoryEditDialog({
             </div>
             <div className="space-y-1.5">
               <label className="text-sm font-medium" htmlFor="source">
-                Source / Donor
+                Source
               </label>
-              <Input
-                id="source"
-                value={form.source}
-                onChange={(e) => handleChange("source", e.target.value)}
-                placeholder="Optional"
-              />
+              <div className="flex gap-2">
+                {!isNewSource ? (
+                    <Select value={form.source} onValueChange={(val) => {
+                        if (val === "new_source_custom") {
+                            setIsNewSource(true);
+                            setForm(p => ({...p, source: ""}));
+                        } else {
+                            setForm(p => ({...p, source: val}));
+                        }
+                    }}>
+                        <SelectTrigger id="source">
+                            <SelectValue placeholder="Select Source" />
+                        </SelectTrigger>
+                        <SelectContent>
+                            {sources.map(s => <SelectItem key={s} value={s}>{s}</SelectItem>)}
+                            <SelectItem value="new_source_custom">+ Add New Source</SelectItem>
+                        </SelectContent>
+                    </Select>
+                ) : (
+                    <div className="flex gap-1 w-full">
+                        <Input 
+                            value={form.source} 
+                            onChange={(e) => setForm(p => ({...p, source: e.target.value}))} 
+                            placeholder="Enter new source"
+                            autoFocus
+                        />
+                        <Button type="button" variant="ghost" size="icon" onClick={() => setIsNewSource(false)}>
+                            <span className="sr-only">Cancel</span>
+                            <XIcon className="h-4 w-4" />
+                        </Button>
+                    </div>
+                )}
+              </div>
             </div>
+            
+            {form.source === "Donation" && (
+                <div className="space-y-1.5 border-l-2 border-indigo-100 pl-4 mt-2">
+                     <div className="relative">
+                        <div className="absolute -left-[21px] top-[14px] w-4 h-px bg-indigo-200"></div>
+                        <label className="text-sm font-medium" htmlFor="donor">
+                            Donor
+                        </label>
+                      </div>
+                      <div className="flex gap-2">
+                        {!isNewDonor ? (
+                            <Select value={form.donor} onValueChange={(val) => {
+                                if (val === "new_donor_custom") {
+                                    setIsNewDonor(true);
+                                    setForm(p => ({...p, donor: ""}));
+                                } else {
+                                    setForm(p => ({...p, donor: val}));
+                                }
+                            }}>
+                                <SelectTrigger id="donor">
+                                    <SelectValue placeholder="Select Donor" />
+                                </SelectTrigger>
+                                <SelectContent>
+                                    {donors.map(d => <SelectItem key={d} value={d}>{d}</SelectItem>)}
+                                    <SelectItem value="new_donor_custom">+ Add New Donor</SelectItem>
+                                </SelectContent>
+                            </Select>
+                        ) : (
+                            <div className="flex gap-1 w-full">
+                                <Input 
+                                    value={form.donor} 
+                                    onChange={(e) => setForm(p => ({...p, donor: e.target.value}))} 
+                                    placeholder="Enter new donor"
+                                    autoFocus
+                                />
+                                <Button type="button" variant="ghost" size="icon" onClick={() => setIsNewDonor(false)}>
+                                    <span className="sr-only">Cancel</span>
+                                    <XIcon className="h-4 w-4" />
+                                </Button>
+                            </div>
+                        )}
+                      </div>
+                </div>
+            )}
           </div>
         ) : (
           <div className="space-y-1.5">

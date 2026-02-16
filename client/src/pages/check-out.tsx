@@ -5,8 +5,9 @@ import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogDescription } from "@/components/ui/dialog";
 import { useToast } from "@/hooks/use-toast";
-import { ShoppingCartIcon } from "lucide-react";
+import { ShoppingCartIcon, AlertTriangleIcon } from "lucide-react";
 
 export default function CheckOutPage() {
   const { inventory, clients, recordOutbound, barcodeCache, upsertBarcodeCache, addOrUpdateItem } =
@@ -17,10 +18,20 @@ export default function CheckOutPage() {
   const [clientName, setClientName] = useState("");
   const [clientIdentifier, setClientIdentifier] = useState("");
   const [clientContact, setClientContact] = useState("");
+  const [clientAllergies, setClientAllergies] = useState<string[]>([]);
 
   const [cart, setCart] = useState<{ itemId: string; quantity: number }[]>([]);
   const [barcode, setBarcode] = useState("");
   const barcodeInputRef = useRef<HTMLInputElement>(null);
+
+  // Allergy warning state
+  const [allergyWarning, setAllergyWarning] = useState<{
+    isOpen: boolean;
+    itemName: string;
+    itemAllergens: string[];
+    clientAllergies: string[];
+    onConfirm: () => void;
+  } | null>(null);
 
   const sortedClients = useMemo(
     () => [...clients].sort((a, b) => a.name.localeCompare(b.name)),
@@ -38,6 +49,7 @@ export default function CheckOutPage() {
       setClientName("");
       setClientIdentifier("");
       setClientContact("");
+      setClientAllergies([]);
       return;
     }
     const c = clients.find((c) => c.id === id);
@@ -45,11 +57,44 @@ export default function CheckOutPage() {
       setClientName(c.name);
       setClientIdentifier(c.identifier);
       setClientContact(c.contact || "");
+      setClientAllergies(c.allergies || []);
     }
   }
 
   function addToCart(itemId: string, quantity: number = 1) {
     if (!itemId) return;
+
+    // Check allergies before adding
+    if (clientId && clientId !== "new") {
+        const item = inventory.find(i => i.id === itemId);
+        if (item && item.allergens && item.allergens.length > 0 && clientAllergies.length > 0) {
+            const matches = item.allergens.filter(a => 
+                clientAllergies.some(ca => ca.toLowerCase().includes(a.toLowerCase()) || a.toLowerCase().includes(ca.toLowerCase()))
+            );
+            
+            if (matches.length > 0) {
+                // Show warning
+                setAllergyWarning({
+                    isOpen: true,
+                    itemName: item.name,
+                    itemAllergens: matches,
+                    clientAllergies: clientAllergies,
+                    onConfirm: () => {
+                        performAddToCart(itemId, quantity);
+                        setAllergyWarning(null);
+                        // Refocus input after confirming
+                        setTimeout(() => barcodeInputRef.current?.focus(), 100);
+                    }
+                });
+                return;
+            }
+        }
+    }
+
+    performAddToCart(itemId, quantity);
+  }
+
+  function performAddToCart(itemId: string, quantity: number) {
     setCart((prev) => {
       const existing = prev.find((c) => c.itemId === itemId);
       if (existing) {
@@ -76,6 +121,7 @@ export default function CheckOutPage() {
           const category = (Array.isArray(p.categories_tags) && p.categories_tags[0]?.split(":").pop()) || "Uncategorized";
           const grams = p.product_quantity && p.product_quantity_unit === "g" ? Number(p.product_quantity) : undefined;
           const weight = grams && !isNaN(grams) ? grams / 453.592 : 0;
+          const allergens = (p.allergens_tags || []).map((a: string) => a.split(":").pop()?.replace(/-/g, " ") || a);
 
           // Check if we already have this item locally to avoid duplicate creation?
           // Requirement says "do not overwrite existing locally edited items unless the item is new"
@@ -89,13 +135,14 @@ export default function CheckOutPage() {
           }
 
           // Not found locally, create it from global data
-          upsertBarcodeCache(trimmed, { name, category, weightPerUnitLbs: weight });
+          upsertBarcodeCache(trimmed, { name, category, weightPerUnitLbs: weight, allergens });
           const item = addOrUpdateItem({
             name: name || "Unknown Item",
             category: category,
             barcode: trimmed,
             quantity: 0, // Initial quantity 0 when discovered at checkout? Or should we prompt? usually 0.
             weightPerUnitLbs: weight,
+            allergens: allergens,
           });
           addToCart(item.id, 1);
           toast({ title: "New item found", description: `${item.name} added from global database.` });
@@ -123,6 +170,7 @@ export default function CheckOutPage() {
         barcode: trimmed,
         quantity: 0,
         weightPerUnitLbs: cached.weightPerUnitLbs ?? 0,
+        allergens: cached.allergens,
       });
       addToCart(item.id, 1);
       toast({ title: "New item from cache", description: `${item.name} added via cached barcode.` });
@@ -318,6 +366,38 @@ export default function CheckOutPage() {
             </Button>
           </div>
         </form>
+
+        <Dialog open={!!allergyWarning} onOpenChange={(open) => { if (!open) setAllergyWarning(null); }}>
+          <DialogContent className="border-red-500 border-2">
+            <DialogHeader>
+              <DialogTitle className="flex items-center gap-2 text-red-600">
+                <AlertTriangleIcon className="h-5 w-5" />
+                Allergy Warning
+              </DialogTitle>
+              <DialogDescription>
+                This item matches allergies listed for <strong>{clientName}</strong>.
+              </DialogDescription>
+            </DialogHeader>
+            <div className="py-4">
+               <div className="space-y-2">
+                 <p className="text-sm">Item: <strong>{allergyWarning?.itemName}</strong></p>
+                 <div className="text-sm">Matched Allergens:
+                    <div className="flex flex-wrap gap-1 mt-1">
+                        {allergyWarning?.itemAllergens.map(a => (
+                            <span key={a} className="bg-red-100 text-red-800 px-2 py-0.5 rounded text-xs font-semibold">{a}</span>
+                        ))}
+                    </div>
+                 </div>
+               </div>
+            </div>
+            <DialogFooter>
+              <Button variant="outline" onClick={() => setAllergyWarning(null)}>Cancel</Button>
+              <Button variant="destructive" onClick={() => allergyWarning?.onConfirm()}>
+                Confirm & Add Anyway
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
       </CardContent>
     </Card>
   );

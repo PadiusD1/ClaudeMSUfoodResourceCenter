@@ -5,22 +5,27 @@ import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { useToast } from "@/hooks/use-toast";
-import { Import, SearchIcon } from "lucide-react";
+import { Import, SearchIcon, XIcon } from "lucide-react";
 
 export default function CheckInPage() {
-  const { inventory, addOrUpdateItem, recordInbound, barcodeCache, upsertBarcodeCache } = useRepository();
+  const { inventory, addOrUpdateItem, recordInbound, barcodeCache, upsertBarcodeCache, sources, donors, addSource, addDonor } = useRepository();
   const { toast } = useToast();
 
   const [mode, setMode] = useState<"existing" | "new">("existing");
   const [selectedId, setSelectedId] = useState<string | "">("");
   const [quantity, setQuantity] = useState<number>(0);
   const [source, setSource] = useState("");
+  const [donor, setDonor] = useState("");
+  const [isNewSource, setIsNewSource] = useState(false);
+  const [isNewDonor, setIsNewDonor] = useState(false);
+
   const [newItem, setNewItem] = useState({
     name: "",
     category: "Uncategorized",
     barcode: "",
     weightPerUnitLbs: 0,
     valuePerUnitUsd: 0,
+    allergens: [] as string[],
   });
   const quantityInputRef = useRef<HTMLInputElement>(null);
 
@@ -44,8 +49,9 @@ export default function CheckInPage() {
           const category = (Array.isArray(p.categories_tags) && p.categories_tags[0]?.split(":").pop()) || "Uncategorized";
           const grams = p.product_quantity && p.product_quantity_unit === "g" ? Number(p.product_quantity) : undefined;
           const weight = grams && !isNaN(grams) ? grams / 453.592 : 0;
+          const allergens = (p.allergens_tags || []).map((a: string) => a.split(":").pop()?.replace(/-/g, " ") || a);
 
-          upsertBarcodeCache(trimmed, { name, category, weightPerUnitLbs: weight });
+          upsertBarcodeCache(trimmed, { name, category, weightPerUnitLbs: weight, allergens });
 
           // If in 'new' mode, prefill
           if (mode === "new") {
@@ -54,7 +60,8 @@ export default function CheckInPage() {
               name: name || prev.name,
               category: category || prev.category,
               barcode: trimmed,
-              weightPerUnitLbs: weight || prev.weightPerUnitLbs
+              weightPerUnitLbs: weight || prev.weightPerUnitLbs,
+              allergens: allergens.length ? allergens : prev.allergens
             }));
             toast({ title: "Product found", description: "Details prefilled from global database." });
             return; // Done
@@ -85,6 +92,7 @@ export default function CheckInPage() {
         barcode: trimmed,
         weightPerUnitLbs: cached.weightPerUnitLbs || 0,
         valuePerUnitUsd: 0,
+        allergens: cached.allergens || [],
       });
       toast({ title: "Item found in cache", description: "Details prefilled from local cache." });
       return;
@@ -123,11 +131,19 @@ export default function CheckInPage() {
         quantity: 0,
         weightPerUnitLbs: newItem.weightPerUnitLbs,
         valuePerUnitUsd: newItem.valuePerUnitUsd,
+        allergens: newItem.allergens,
       });
       itemId = created.id;
     }
 
     if (!itemId) return;
+
+    if (isNewSource && source.trim()) {
+        addSource(source.trim());
+    }
+    if (isNewDonor && donor.trim() && source === "Donation") {
+        addDonor(donor.trim());
+    }
 
     const location = await getCurrentLocation();
 
@@ -135,6 +151,7 @@ export default function CheckInPage() {
       itemId,
       quantity,
       source: source.trim() || undefined,
+      donor: (source === "Donation" ? (donor.trim() || undefined) : undefined),
       location,
     });
 
@@ -144,7 +161,7 @@ export default function CheckInPage() {
     });
 
     setQuantity(0);
-    setSource("");
+    // Keep source/donor settings for subsequent scans in the same batch
     // Don't reset selectedId or new item details aggressively so they can add more batches if needed,
     // but typically reset quantity is enough.
     // If it was new, switch to existing for that item?
@@ -157,6 +174,7 @@ export default function CheckInPage() {
         barcode: "",
         weightPerUnitLbs: 0,
         valuePerUnitUsd: 0,
+        allergens: [],
       });
     }
   }
@@ -328,16 +346,87 @@ export default function CheckInPage() {
             </div>
             <div className="space-y-1.5 md:col-span-2">
               <label className="text-sm font-medium" htmlFor="source" data-testid="label-source-donor">
-                Source / donor (optional)
+                Source
               </label>
-              <Input
-                id="source"
-                value={source}
-                onChange={(e) => setSource(e.target.value)}
-                data-testid="input-source-donor"
-              />
+              <div className="flex gap-2">
+                {!isNewSource ? (
+                  <Select value={source} onValueChange={(val) => {
+                    if (val === "new_source_custom") {
+                        setIsNewSource(true);
+                        setSource("");
+                    } else {
+                        setSource(val);
+                    }
+                  }}>
+                    <SelectTrigger id="source">
+                        <SelectValue placeholder="Select Source" />
+                    </SelectTrigger>
+                    <SelectContent>
+                        {sources.map(s => <SelectItem key={s} value={s}>{s}</SelectItem>)}
+                        <SelectItem value="new_source_custom">+ Add New Source</SelectItem>
+                    </SelectContent>
+                  </Select>
+                ) : (
+                    <div className="flex gap-1 w-full">
+                        <Input 
+                            value={source} 
+                            onChange={(e) => setSource(e.target.value)} 
+                            placeholder="Enter new source"
+                            autoFocus
+                        />
+                        <Button type="button" variant="ghost" size="icon" onClick={() => setIsNewSource(false)}>
+                            <span className="sr-only">Cancel</span>
+                            <XIcon className="h-4 w-4" />
+                        </Button>
+                    </div>
+                )}
+              </div>
             </div>
           </div>
+          
+          {source === "Donation" && (
+              <div className="space-y-1.5 border-l-2 border-indigo-100 pl-4 mt-2">
+                  <div className="relative">
+                    <div className="absolute -left-[21px] top-[14px] w-4 h-px bg-indigo-200"></div>
+                    <label className="text-sm font-medium" htmlFor="donor">
+                        Donor
+                    </label>
+                  </div>
+                  <div className="flex gap-2">
+                    {!isNewDonor ? (
+                        <Select value={donor} onValueChange={(val) => {
+                            if (val === "new_donor_custom") {
+                                setIsNewDonor(true);
+                                setDonor("");
+                            } else {
+                                setDonor(val);
+                            }
+                        }}>
+                            <SelectTrigger id="donor">
+                                <SelectValue placeholder="Select Donor" />
+                            </SelectTrigger>
+                            <SelectContent>
+                                {donors.map(d => <SelectItem key={d} value={d}>{d}</SelectItem>)}
+                                <SelectItem value="new_donor_custom">+ Add New Donor</SelectItem>
+                            </SelectContent>
+                        </Select>
+                    ) : (
+                        <div className="flex gap-1 w-full">
+                            <Input 
+                                value={donor} 
+                                onChange={(e) => setDonor(e.target.value)} 
+                                placeholder="Enter new donor"
+                                autoFocus
+                            />
+                            <Button type="button" variant="ghost" size="icon" onClick={() => setIsNewDonor(false)}>
+                                <span className="sr-only">Cancel</span>
+                                <XIcon className="h-4 w-4" />
+                            </Button>
+                        </div>
+                    )}
+                  </div>
+              </div>
+          )}
 
           <div className="flex items-center justify-between pt-2">
             <p className="text-[11px] text-muted-foreground" data-testid="text-check-in-help">

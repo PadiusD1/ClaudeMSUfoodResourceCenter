@@ -9,6 +9,7 @@ export type InventoryItem = {
   weightPerUnitLbs: number;
   valuePerUnitUsd: number;
   reorderThreshold?: number;
+  allergens?: string[];
   createdAt: string;
   updatedAt: string;
 };
@@ -18,6 +19,7 @@ export type ClientRecord = {
   name: string;
   identifier: string;
   contact?: string;
+  allergies?: string[];
   notes?: string;
   createdAt: string;
   updatedAt: string;
@@ -45,6 +47,7 @@ export type Transaction = {
   timestamp: string;
   items: TransactionItem[];
   source?: string;
+  donor?: string;
   clientId?: string;
   clientName?: string;
   location?: GeoLocation;
@@ -58,6 +61,7 @@ export type BarcodeCacheEntry = {
   name?: string;
   category?: string;
   weightPerUnitLbs?: number;
+  allergens?: string[];
   cachedAt: string;
 };
 
@@ -67,6 +71,8 @@ export type RepositoryState = {
   transactions: Transaction[];
   settings: Settings;
   barcodeCache: Record<string, BarcodeCacheEntry>;
+  sources: string[];
+  donors: string[];
 };
 
 const STORAGE_KEY = "morgan-state-repository:v1";
@@ -79,6 +85,8 @@ const defaultState: RepositoryState = {
     visitWarningDays: 7,
   },
   barcodeCache: {},
+  sources: ["Donation", "Purchase", "Transfer", "Other"],
+  donors: ["Morgan State University", "Maryland Food Bank", "Local Grocery"],
 };
 
 function loadState(): RepositoryState {
@@ -115,6 +123,7 @@ export type RepositoryContextValue = RepositoryState & {
     itemId: string;
     quantity: number;
     source?: string;
+    donor?: string;
     timestamp?: string;
     location?: GeoLocation;
   }) => void;
@@ -127,6 +136,8 @@ export type RepositoryContextValue = RepositoryState & {
   upsertClient: (partial: Partial<ClientRecord> & { name: string; identifier: string }) => ClientRecord;
   updateSettings: (partial: Partial<Settings>) => void;
   upsertBarcodeCache: (barcode: string, entry: Omit<BarcodeCacheEntry, "cachedAt">) => void;
+  addSource: (source: string) => void;
+  addDonor: (donor: string) => void;
 };
 
 const RepositoryContext = createContext<RepositoryContextValue | null>(null);
@@ -169,6 +180,7 @@ export function RepositoryProvider({ children }: { children: React.ReactNode }) 
         weightPerUnitLbs: partial.weightPerUnitLbs ?? 0,
         valuePerUnitUsd: partial.valuePerUnitUsd ?? 0,
         reorderThreshold: partial.reorderThreshold,
+        allergens: partial.allergens,
         createdAt: now,
         updatedAt: now,
       };
@@ -212,6 +224,7 @@ export function RepositoryProvider({ children }: { children: React.ReactNode }) 
         name: partial.name,
         identifier: partial.identifier,
         contact: partial.contact,
+        allergies: partial.allergies,
         notes: partial.notes,
         createdAt: now,
         updatedAt: now,
@@ -224,10 +237,11 @@ export function RepositoryProvider({ children }: { children: React.ReactNode }) 
       itemId: string;
       quantity: number;
       source?: string;
+      donor?: string;
       timestamp?: string;
       location?: GeoLocation;
     }) {
-      const { itemId, quantity, source, location } = options;
+      const { itemId, quantity, source, donor, location } = options;
       const timestamp = options.timestamp ?? new Date().toISOString();
 
       if (!quantity || quantity <= 0) return;
@@ -256,6 +270,7 @@ export function RepositoryProvider({ children }: { children: React.ReactNode }) 
             },
           ],
           source,
+          donor,
           location,
         };
 
@@ -349,6 +364,20 @@ export function RepositoryProvider({ children }: { children: React.ReactNode }) 
       }));
     }
 
+    function addSource(source: string) {
+      setState((prev) => {
+        if (prev.sources?.includes(source)) return prev;
+        return { ...prev, sources: [...(prev.sources || []), source] };
+      });
+    }
+
+    function addDonor(donor: string) {
+      setState((prev) => {
+        if (prev.donors?.includes(donor)) return prev;
+        return { ...prev, donors: [...(prev.donors || []), donor] };
+      });
+    }
+
     return {
       ...state,
       addOrUpdateItem,
@@ -358,6 +387,8 @@ export function RepositoryProvider({ children }: { children: React.ReactNode }) 
       upsertClient,
       updateSettings,
       upsertBarcodeCache,
+      addSource,
+      addDonor,
     };
   }, [state]);
 
