@@ -1,5 +1,5 @@
-import React, { useMemo, useState } from "react";
-import { useRepository, InventoryItem, isLowStock, getCurrentLocation } from "@/lib/repository";
+import React, { useCallback, useMemo, useRef, useState } from "react";
+import { useRepository, InventoryItem, isLowStock, getCurrentLocation, suggestCategory, learnCategoryAssociation } from "@/lib/repository";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Button } from "@/components/ui/button";
@@ -8,7 +8,9 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 import { useToast } from "@/hooks/use-toast";
 import { Badge } from "@/components/ui/badge";
-import { PencilIcon, PlusIcon, SearchIcon, XIcon } from "lucide-react";
+import { Progress } from "@/components/ui/progress";
+import { CheckCircle2Icon, FileSpreadsheetIcon, PencilIcon, PlusIcon, SearchIcon, UploadIcon, XIcon } from "lucide-react";
+import Papa from "papaparse";
 
 export default function InventoryPage() {
   const { inventory, addOrUpdateItem, adjustItemQuantity, recordInbound, upsertBarcodeCache, barcodeCache, sources, donors, addSource, addDonor } = useRepository();
@@ -16,6 +18,7 @@ export default function InventoryPage() {
   const [query, setQuery] = useState("");
   const [categoryFilter, setCategoryFilter] = useState<string | "all">("all");
   const [editingItem, setEditingItem] = useState<InventoryItem | null>(null);
+  const [showImport, setShowImport] = useState(false);
 
   const categories = useMemo(
     () => Array.from(new Set(inventory.map((i) => i.category || "Uncategorized"))).sort(),
@@ -102,41 +105,59 @@ export default function InventoryPage() {
               </SelectContent>
             </Select>
           </div>
-          <Dialog open={!!editingItem} onOpenChange={(open) => !open && setEditingItem(null)}>
-            <DialogTrigger asChild>
-              <Button
-                size="sm"
-                className="shrink-0"
-                onClick={() => setEditingItem({
-                  id: "",
-                  name: "",
-                  category: "Uncategorized",
-                  barcode: "",
-                  quantity: 0,
-                  weightPerUnitLbs: 0,
-                  valuePerUnitUsd: 0,
-                  allergens: [],
-                  createdAt: "",
-                  updatedAt: "",
-                })}
-                data-testid="button-add-item"
-              >
-                <PlusIcon className="h-4 w-4" />
-                New item
-              </Button>
-            </DialogTrigger>
-            {editingItem && (
-              <InventoryEditDialog
-                item={editingItem}
-                onCancel={() => setEditingItem(null)}
-                onSave={handleSave}
-                upsertBarcodeCache={upsertBarcodeCache}
-                barcodeCache={barcodeCache}
-                sources={sources}
-                donors={donors}
-              />
-            )}
-          </Dialog>
+          <div className="flex items-center gap-2 shrink-0">
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => setShowImport(true)}
+              data-testid="button-import-csv"
+            >
+              <UploadIcon className="h-4 w-4" />
+              Import CSV
+            </Button>
+            <Dialog open={!!editingItem} onOpenChange={(open) => !open && setEditingItem(null)}>
+              <DialogTrigger asChild>
+                <Button
+                  size="sm"
+                  className="shrink-0"
+                  onClick={() => setEditingItem({
+                    id: "",
+                    name: "",
+                    category: "Uncategorized",
+                    barcode: "",
+                    quantity: 0,
+                    weightPerUnitLbs: 0,
+                    valuePerUnitUsd: 0,
+                    allergens: [],
+                    createdAt: "",
+                    updatedAt: "",
+                  })}
+                  data-testid="button-add-item"
+                >
+                  <PlusIcon className="h-4 w-4" />
+                  New item
+                </Button>
+              </DialogTrigger>
+              {editingItem && (
+                <InventoryEditDialog
+                  item={editingItem}
+                  onCancel={() => setEditingItem(null)}
+                  onSave={handleSave}
+                  upsertBarcodeCache={upsertBarcodeCache}
+                  barcodeCache={barcodeCache}
+                  sources={sources}
+                  donors={donors}
+                />
+              )}
+            </Dialog>
+          </div>
+
+          {showImport && (
+            <CsvImportDialog
+              onClose={() => setShowImport(false)}
+              addOrUpdateItem={addOrUpdateItem}
+            />
+          )}
         </CardContent>
       </Card>
 
@@ -329,13 +350,38 @@ function InventoryEditDialog({
     setForm((prev) => ({ ...prev, [key]: value }));
   }
 
+  function handleNameChange(newName: string) {
+    setForm((prev) => {
+      const updated = { ...prev, name: newName };
+      // Auto-suggest category only if still "Uncategorized" (user hasn't picked one)
+      if (prev.category === "Uncategorized" && newName.trim().length >= 3) {
+        const suggestion = suggestCategory(newName);
+        if (suggestion.confidence >= 0.8) {
+          updated.category = suggestion.category;
+        } else if (suggestion.confidence > 0.5) {
+          // Show toast suggestion for lower confidence but don't auto-assign
+          toast({
+            title: `Suggested: ${suggestion.category}`,
+            description: "Click to change in the category field.",
+          });
+        }
+      }
+      return updated;
+    });
+  }
+
   function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     if (!form.name.trim()) return;
+    const finalCategory = form.category.trim() || "Uncategorized";
+    // Learn the association so future items with similar names get this category
+    if (finalCategory !== "Uncategorized") {
+      learnCategoryAssociation(form.name.trim(), finalCategory);
+    }
     onSave({
       ...form,
       name: form.name.trim(),
-      category: form.category.trim() || "Uncategorized",
+      category: finalCategory,
       barcode: form.barcode?.trim() || undefined,
       source: form.source.trim() || undefined,
       donor: form.donor.trim() || undefined,
@@ -381,7 +427,7 @@ function InventoryEditDialog({
           <Input
             id="item-name"
             value={form.name}
-            onChange={(e) => handleChange("name", e.target.value)}
+            onChange={(e) => handleNameChange(e.target.value)}
             required
             data-testid="input-item-name"
           />
@@ -614,5 +660,346 @@ function InventoryEditDialog({
         </DialogFooter>
       </form>
     </DialogContent>
+  );
+}
+
+// ─── Column Mapping Config ──────────────────────────────────────────────────
+
+type MappableField = "name" | "barcode" | "category" | "quantity" | "weight" | "skip";
+
+const FIELD_LABELS: Record<MappableField, string> = {
+  name: "Item Name",
+  barcode: "Barcode / UPC",
+  category: "Category",
+  quantity: "Quantity",
+  weight: "Weight (lbs)",
+  skip: "(Skip)",
+};
+
+const HEADER_ALIASES: Record<string, MappableField> = {
+  name: "name",
+  "item name": "name",
+  "item": "name",
+  product: "name",
+  "product name": "name",
+  description: "name",
+  upc: "barcode",
+  barcode: "barcode",
+  code: "barcode",
+  ean: "barcode",
+  "upc code": "barcode",
+  category: "category",
+  type: "category",
+  "product type": "category",
+  department: "category",
+  qty: "quantity",
+  quantity: "quantity",
+  count: "quantity",
+  amount: "quantity",
+  "on hand": "quantity",
+  weight: "weight",
+  "weight (lbs)": "weight",
+  "weight per unit": "weight",
+  "unit weight": "weight",
+  lbs: "weight",
+};
+
+function autoDetectMapping(headers: string[]): Record<number, MappableField> {
+  const mapping: Record<number, MappableField> = {};
+  const usedFields = new Set<MappableField>();
+
+  for (let i = 0; i < headers.length; i++) {
+    const normalized = headers[i].trim().toLowerCase();
+    const match = HEADER_ALIASES[normalized];
+    if (match && !usedFields.has(match)) {
+      mapping[i] = match;
+      usedFields.add(match);
+    } else {
+      mapping[i] = "skip";
+    }
+  }
+  return mapping;
+}
+
+type ImportStep = "upload" | "mapping" | "importing" | "done";
+
+type ImportResult = {
+  created: number;
+  enriched: number;
+  failed: number;
+  errors: string[];
+};
+
+function CsvImportDialog({
+  onClose,
+  addOrUpdateItem,
+}: {
+  onClose: () => void;
+  addOrUpdateItem: (partial: Partial<InventoryItem> & { name: string }) => InventoryItem;
+}) {
+  const { toast } = useToast();
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [step, setStep] = useState<ImportStep>("upload");
+  const [headers, setHeaders] = useState<string[]>([]);
+  const [rows, setRows] = useState<string[][]>([]);
+  const [mapping, setMapping] = useState<Record<number, MappableField>>({});
+  const [progress, setProgress] = useState(0);
+  const [result, setResult] = useState<ImportResult>({ created: 0, enriched: 0, failed: 0, errors: [] });
+
+  const handleFileSelect = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    Papa.parse(file, {
+      complete: (results) => {
+        const data = results.data as string[][];
+        if (data.length < 2) {
+          toast({ title: "Invalid file", description: "File must have a header row and at least one data row." });
+          return;
+        }
+        const headerRow = data[0].map((h) => (h ?? "").toString().trim());
+        const dataRows = data.slice(1).filter((row) => row.some((cell) => cell && cell.toString().trim()));
+        setHeaders(headerRow);
+        setRows(dataRows);
+        setMapping(autoDetectMapping(headerRow));
+        setStep("mapping");
+      },
+      error: () => {
+        toast({ title: "Parse error", description: "Could not parse the file. Ensure it is a valid CSV." });
+      },
+    });
+  }, [toast]);
+
+  function updateMapping(colIndex: number, field: MappableField) {
+    setMapping((prev) => {
+      const next = { ...prev };
+      // Remove duplicate: if another column already has this field, set it to skip
+      if (field !== "skip") {
+        for (const key of Object.keys(next)) {
+          if (next[Number(key)] === field && Number(key) !== colIndex) {
+            next[Number(key)] = "skip";
+          }
+        }
+      }
+      next[colIndex] = field;
+      return next;
+    });
+  }
+
+  const hasNameColumn = Object.values(mapping).includes("name");
+
+  async function startImport() {
+    if (!hasNameColumn) {
+      toast({ title: "Missing name column", description: "You must map at least one column to 'Item Name'." });
+      return;
+    }
+
+    setStep("importing");
+    const importResult: ImportResult = { created: 0, enriched: 0, failed: 0, errors: [] };
+
+    // Build reverse mapping: field -> column index
+    const fieldToCol: Partial<Record<MappableField, number>> = {};
+    for (const [col, field] of Object.entries(mapping)) {
+      if (field !== "skip") {
+        fieldToCol[field] = Number(col);
+      }
+    }
+
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i];
+      try {
+        const nameVal = fieldToCol.name !== undefined ? (row[fieldToCol.name] ?? "").toString().trim() : "";
+        if (!nameVal) {
+          importResult.failed++;
+          importResult.errors.push(`Row ${i + 2}: Empty name, skipped.`);
+          setProgress(Math.round(((i + 1) / rows.length) * 100));
+          continue;
+        }
+
+        const barcodeVal = fieldToCol.barcode !== undefined ? (row[fieldToCol.barcode] ?? "").toString().trim() : "";
+        let categoryVal = fieldToCol.category !== undefined ? (row[fieldToCol.category] ?? "").toString().trim() : "";
+        const quantityVal = fieldToCol.quantity !== undefined ? parseInt((row[fieldToCol.quantity] ?? "0").toString(), 10) || 0 : 0;
+        const weightVal = fieldToCol.weight !== undefined ? parseFloat((row[fieldToCol.weight] ?? "0").toString()) || 0 : 0;
+
+        // Auto-categorize if no category provided
+        if (!categoryVal) {
+          const suggestion = suggestCategory(nameVal);
+          if (suggestion.confidence >= 0.7) {
+            categoryVal = suggestion.category;
+          }
+        }
+
+        const item: Partial<InventoryItem> & { name: string } = {
+          name: nameVal,
+          barcode: barcodeVal || undefined,
+          category: categoryVal || "Uncategorized",
+          quantity: quantityVal,
+          weightPerUnitLbs: weightVal,
+        };
+
+        addOrUpdateItem(item);
+        importResult.created++;
+
+        // Attempt barcode enrichment if barcode is present
+        if (barcodeVal) {
+          try {
+            const res = await fetch(`/api/barcode-lookup/${encodeURIComponent(barcodeVal)}`);
+            if (res.ok) {
+              const data = await res.json();
+              if (data.status === "created" || data.status === "exists") {
+                importResult.enriched++;
+              }
+            }
+          } catch {
+            // Enrichment is best-effort, not critical
+          }
+        }
+      } catch (err) {
+        importResult.failed++;
+        importResult.errors.push(`Row ${i + 2}: ${err instanceof Error ? err.message : "Unknown error"}`);
+      }
+
+      setProgress(Math.round(((i + 1) / rows.length) * 100));
+    }
+
+    setResult(importResult);
+    setStep("done");
+  }
+
+  return (
+    <Dialog open onOpenChange={(open) => !open && onClose()}>
+      <DialogContent className="max-w-2xl max-h-[80vh] overflow-y-auto" data-testid="dialog-csv-import">
+        <DialogHeader>
+          <DialogTitle className="flex items-center gap-2">
+            <FileSpreadsheetIcon className="h-5 w-5" />
+            {step === "upload" && "Import from CSV"}
+            {step === "mapping" && "Map Columns"}
+            {step === "importing" && "Importing..."}
+            {step === "done" && "Import Complete"}
+          </DialogTitle>
+        </DialogHeader>
+
+        {step === "upload" && (
+          <div className="space-y-4">
+            <p className="text-sm text-muted-foreground">
+              Upload a CSV or Excel file. The first row should contain column headers.
+            </p>
+            <div
+              className="border-2 border-dashed rounded-lg p-8 text-center cursor-pointer hover:border-primary/50 transition-colors"
+              onClick={() => fileInputRef.current?.click()}
+            >
+              <UploadIcon className="h-10 w-10 mx-auto mb-3 text-muted-foreground" />
+              <p className="text-sm font-medium">Click to choose a file</p>
+              <p className="text-xs text-muted-foreground mt-1">Supports .csv and .xlsx</p>
+            </div>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".csv,.xlsx,.xls"
+              className="hidden"
+              onChange={handleFileSelect}
+              data-testid="input-csv-file"
+            />
+            <DialogFooter>
+              <Button variant="ghost" onClick={onClose}>Cancel</Button>
+            </DialogFooter>
+          </div>
+        )}
+
+        {step === "mapping" && (
+          <div className="space-y-4">
+            <p className="text-sm text-muted-foreground">
+              Review column mappings below. {rows.length} data rows detected.
+            </p>
+            <div className="border rounded-md overflow-hidden">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead className="w-1/3">CSV Column</TableHead>
+                    <TableHead className="w-1/3">Maps To</TableHead>
+                    <TableHead className="w-1/3">Sample</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {headers.map((header, idx) => (
+                    <TableRow key={idx}>
+                      <TableCell className="text-sm font-medium">{header || `Column ${idx + 1}`}</TableCell>
+                      <TableCell>
+                        <Select
+                          value={mapping[idx] || "skip"}
+                          onValueChange={(val) => updateMapping(idx, val as MappableField)}
+                        >
+                          <SelectTrigger className="h-8 text-xs">
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            {(Object.keys(FIELD_LABELS) as MappableField[]).map((field) => (
+                              <SelectItem key={field} value={field}>
+                                {FIELD_LABELS[field]}
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                      </TableCell>
+                      <TableCell className="text-xs text-muted-foreground truncate max-w-[150px]">
+                        {rows[0]?.[idx] ?? "-"}
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </div>
+            {!hasNameColumn && (
+              <p className="text-sm text-destructive">
+                You must map at least one column to "Item Name" to proceed.
+              </p>
+            )}
+            <DialogFooter className="flex items-center justify-between gap-2">
+              <Button variant="ghost" onClick={() => { setStep("upload"); setHeaders([]); setRows([]); }}>
+                Back
+              </Button>
+              <Button onClick={startImport} disabled={!hasNameColumn}>
+                Import {rows.length} rows
+              </Button>
+            </DialogFooter>
+          </div>
+        )}
+
+        {step === "importing" && (
+          <div className="space-y-4 py-4">
+            <div className="text-center">
+              <p className="text-sm font-medium mb-2">Processing rows...</p>
+              <Progress value={progress} className="h-3" />
+              <p className="text-xs text-muted-foreground mt-2">{progress}% complete</p>
+            </div>
+          </div>
+        )}
+
+        {step === "done" && (
+          <div className="space-y-4">
+            <div className="flex items-center gap-3 p-4 bg-green-50 dark:bg-green-950/20 rounded-lg">
+              <CheckCircle2Icon className="h-8 w-8 text-green-600 shrink-0" />
+              <div>
+                <p className="text-sm font-medium">Import finished</p>
+                <p className="text-xs text-muted-foreground mt-1">
+                  {result.created} items created, {result.enriched} enriched via barcode lookup
+                  {result.failed > 0 && `, ${result.failed} failed`}
+                </p>
+              </div>
+            </div>
+            {result.errors.length > 0 && (
+              <div className="max-h-32 overflow-y-auto border rounded-md p-2">
+                {result.errors.map((err, i) => (
+                  <p key={i} className="text-xs text-destructive">{err}</p>
+                ))}
+              </div>
+            )}
+            <DialogFooter>
+              <Button onClick={onClose}>Done</Button>
+            </DialogFooter>
+          </div>
+        )}
+      </DialogContent>
+    </Dialog>
   );
 }

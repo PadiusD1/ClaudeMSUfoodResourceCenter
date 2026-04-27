@@ -1,16 +1,41 @@
-import {
-  type User,
-  type InsertUser,
-  type InventoryItem,
-  type InsertInventoryItem,
-  type Client,
-  type InsertClient,
-  type Transaction,
-  type InsertTransaction,
-  type TransactionItem,
-  type InsertTransactionItem,
+/**
+ * Storage layer – IStorage interface + concrete implementation.
+ *
+ * The exported `storage` singleton was previously a MemStorage (in-memory Maps).
+ * It is now a SqliteStorage backed by a persistent file on disk.
+ *
+ * Location: %LOCALAPPDATA%\MorganPantryStore\app.db
+ *
+ * The IStorage interface is unchanged — all route handlers continue to work
+ * without modification.
+ */
+
+import type {
+  User,
+  InsertUser,
+  InventoryItem,
+  InsertInventoryItem,
+  Client,
+  InsertClient,
+  Transaction,
+  InsertTransaction,
+  TransactionItem,
+  InsertTransactionItem,
+  PackComponent,
+  InsertPackComponent,
+  PriceHistory,
+  InsertPriceHistory,
+  WeightHistory,
+  InsertWeightHistory,
+  HouseholdMember,
+  InsertHouseholdMember,
+  ItemGroup,
+  InsertItemGroup,
+  ItemGroupItem,
+  InsertItemGroupItem,
 } from "@shared/schema";
-import { randomUUID } from "crypto";
+
+// ─── IStorage interface (unchanged) ─────────────────────────────────────────
 
 export interface IStorage {
   // Users
@@ -21,6 +46,7 @@ export interface IStorage {
   // Inventory
   getInventoryItems(): Promise<InventoryItem[]>;
   getInventoryItem(id: string): Promise<InventoryItem | undefined>;
+  getInventoryItemByBarcode(barcode: string): Promise<InventoryItem | undefined>;
   createInventoryItem(item: InsertInventoryItem): Promise<InventoryItem>;
   updateInventoryItem(
     id: string,
@@ -36,6 +62,7 @@ export interface IStorage {
     id: string,
     client: Partial<InsertClient>,
   ): Promise<Client | undefined>;
+  deleteClient(id: string): Promise<boolean>;
 
   // Transactions
   getTransactions(): Promise<Transaction[]>;
@@ -44,201 +71,86 @@ export interface IStorage {
   // Transaction Items
   getTransactionItems(transactionId: string): Promise<TransactionItem[]>;
   createTransactionItem(item: InsertTransactionItem): Promise<TransactionItem>;
+
+  // Pack Components
+  getPackComponents(parentItemId: string): Promise<PackComponent[]>;
+  createPackComponent(comp: InsertPackComponent): Promise<PackComponent>;
+
+  // Price History
+  getPriceHistory(inventoryItemId: string): Promise<PriceHistory[]>;
+  createPriceHistory(entry: InsertPriceHistory): Promise<PriceHistory>;
+
+  // Weight History
+  getWeightHistory(inventoryItemId: string): Promise<WeightHistory[]>;
+  createWeightHistory(entry: InsertWeightHistory): Promise<WeightHistory>;
+
+  // Household Members
+  getHouseholdMembers(clientId: string): Promise<HouseholdMember[]>;
+  createHouseholdMember(member: InsertHouseholdMember): Promise<HouseholdMember>;
+  deleteHouseholdMember(id: string): Promise<boolean>;
+
+  // Item Groups
+  getItemGroups(): Promise<ItemGroup[]>;
+  getItemGroup(id: string): Promise<ItemGroup | undefined>;
+  createItemGroup(group: InsertItemGroup): Promise<ItemGroup>;
+  updateItemGroup(id: string, group: Partial<InsertItemGroup>): Promise<ItemGroup | undefined>;
+  deleteItemGroup(id: string): Promise<boolean>;
+
+  // Item Group Items
+  getItemGroupItems(groupId: string): Promise<ItemGroupItem[]>;
+  createItemGroupItem(item: InsertItemGroupItem): Promise<ItemGroupItem>;
+  deleteItemGroupItem(id: string): Promise<boolean>;
+
+  // Settings
+  getSetting(key: string): Promise<string | undefined>;
+  setSetting(key: string, value: string): Promise<void>;
+  getAllSettings(): Promise<Record<string, string>>;
+
+  // ─── Requests ─────────────────────────────────────────────────────────
+  getRequests(filters?: { status?: string; clientIdentifier?: string; dateFrom?: string; dateTo?: string }): Promise<any[]>;
+  getRequest(id: string): Promise<any | undefined>;
+  createRequest(data: any): Promise<any>;
+  updateRequest(id: string, data: any): Promise<any | undefined>;
+  getRequestsByClientIdentifier(identifier: string): Promise<any[]>;
+  getRequestCountSince(identifier: string, since: string): Promise<number>;
+
+  // ─── Request Items ────────────────────────────────────────────────────
+  getRequestItems(requestId: string): Promise<any[]>;
+  createRequestItem(data: any): Promise<any>;
+  updateRequestItem(id: string, data: any): Promise<any | undefined>;
+
+  // ─── Request Audit Log ────────────────────────────────────────────────
+  getRequestAuditLog(requestId: string): Promise<any[]>;
+  createAuditLogEntry(data: any): Promise<any>;
+
+  // ─── Notifications ────────────────────────────────────────────────────
+  getNotifications(recipientId: string): Promise<any[]>;
+  getUnreadNotificationCount(recipientId: string): Promise<number>;
+  createNotification(data: any): Promise<any>;
+  markNotificationRead(id: string): Promise<void>;
+  markAllNotificationsRead(recipientId: string): Promise<void>;
+
+  // ─── Inventory Reservation ────────────────────────────────────────────
+  reserveInventory(itemId: string, quantity: number): Promise<void>;
+  releaseInventory(itemId: string, quantity: number): Promise<void>;
+  getAvailableQuantity(itemId: string): Promise<number>;
+
+  // ─── Donors ─────────────────────────────────────────────────────────
+  getDonors(): Promise<any[]>;
+  getDonor(id: string): Promise<any | undefined>;
+  getDonorByName(name: string): Promise<any | undefined>;
+  createDonor(data: any): Promise<any>;
+  updateDonor(id: string, data: any): Promise<any | undefined>;
+  deleteDonor(id: string): Promise<boolean>;
 }
 
-export class MemStorage implements IStorage {
-  private users: Map<string, User>;
-  private inventoryItemsMap: Map<string, InventoryItem>;
-  private clientsMap: Map<string, Client>;
-  private transactionsMap: Map<string, Transaction>;
-  private transactionItemsMap: Map<string, TransactionItem>;
+// ─── Concrete implementation: SQLite ────────────────────────────────────────
 
-  constructor() {
-    this.users = new Map();
-    this.inventoryItemsMap = new Map();
-    this.clientsMap = new Map();
-    this.transactionsMap = new Map();
-    this.transactionItemsMap = new Map();
-  }
+import { initDatabase } from "./db";
+import { SqliteStorage } from "./sqlite-storage";
 
-  // ─── Users ───────────────────────────────────────────────────────────────
+const db = initDatabase();
+export const storage: IStorage = new SqliteStorage(db);
 
-  async getUser(id: string): Promise<User | undefined> {
-    return this.users.get(id);
-  }
-
-  async getUserByUsername(username: string): Promise<User | undefined> {
-    return Array.from(this.users.values()).find(
-      (user) => user.username === username,
-    );
-  }
-
-  async createUser(insertUser: InsertUser): Promise<User> {
-    const now = new Date();
-    const user: User = {
-      id: randomUUID(),
-      username: insertUser.username,
-      password: insertUser.password,
-      role: insertUser.role ?? "volunteer",
-      createdAt: now,
-      updatedAt: now,
-    };
-    this.users.set(user.id, user);
-    return user;
-  }
-
-  // ─── Inventory ─────────────────────────────────────────────────────────
-
-  async getInventoryItems(): Promise<InventoryItem[]> {
-    return Array.from(this.inventoryItemsMap.values());
-  }
-
-  async getInventoryItem(id: string): Promise<InventoryItem | undefined> {
-    return this.inventoryItemsMap.get(id);
-  }
-
-  async createInventoryItem(
-    insert: InsertInventoryItem,
-  ): Promise<InventoryItem> {
-    const now = new Date();
-    const item: InventoryItem = {
-      id: randomUUID(),
-      name: insert.name,
-      category: insert.category ?? "Uncategorized",
-      barcode: insert.barcode ?? null,
-      quantity: insert.quantity ?? 0,
-      weightPerUnitLbs: insert.weightPerUnitLbs ?? "0",
-      valuePerUnitUsd: insert.valuePerUnitUsd ?? "0",
-      reorderThreshold: insert.reorderThreshold ?? null,
-      allergens: insert.allergens ?? [],
-      expirationDate: insert.expirationDate ?? null,
-      createdAt: now,
-      updatedAt: now,
-    };
-    this.inventoryItemsMap.set(item.id, item);
-    return item;
-  }
-
-  async updateInventoryItem(
-    id: string,
-    partial: Partial<InsertInventoryItem>,
-  ): Promise<InventoryItem | undefined> {
-    const existing = this.inventoryItemsMap.get(id);
-    if (!existing) return undefined;
-
-    const updated: InventoryItem = {
-      ...existing,
-      ...partial,
-      id: existing.id,
-      createdAt: existing.createdAt,
-      updatedAt: new Date(),
-    };
-    this.inventoryItemsMap.set(id, updated);
-    return updated;
-  }
-
-  // ─── Clients ───────────────────────────────────────────────────────────
-
-  async getClients(): Promise<Client[]> {
-    return Array.from(this.clientsMap.values());
-  }
-
-  async getClient(id: string): Promise<Client | undefined> {
-    return this.clientsMap.get(id);
-  }
-
-  async getClientByIdentifier(
-    identifier: string,
-  ): Promise<Client | undefined> {
-    return Array.from(this.clientsMap.values()).find(
-      (c) => c.identifier === identifier,
-    );
-  }
-
-  async createClient(insert: InsertClient): Promise<Client> {
-    const now = new Date();
-    const client: Client = {
-      id: randomUUID(),
-      name: insert.name,
-      identifier: insert.identifier,
-      contact: insert.contact ?? null,
-      allergies: insert.allergies ?? [],
-      notes: insert.notes ?? null,
-      createdAt: now,
-      updatedAt: now,
-    };
-    this.clientsMap.set(client.id, client);
-    return client;
-  }
-
-  async updateClient(
-    id: string,
-    partial: Partial<InsertClient>,
-  ): Promise<Client | undefined> {
-    const existing = this.clientsMap.get(id);
-    if (!existing) return undefined;
-
-    const updated: Client = {
-      ...existing,
-      ...partial,
-      id: existing.id,
-      createdAt: existing.createdAt,
-      updatedAt: new Date(),
-    };
-    this.clientsMap.set(id, updated);
-    return updated;
-  }
-
-  // ─── Transactions ──────────────────────────────────────────────────────
-
-  async getTransactions(): Promise<Transaction[]> {
-    return Array.from(this.transactionsMap.values());
-  }
-
-  async createTransaction(insert: InsertTransaction): Promise<Transaction> {
-    const now = new Date();
-    const tx: Transaction = {
-      id: randomUUID(),
-      type: insert.type,
-      timestamp: insert.timestamp ?? now,
-      source: insert.source ?? null,
-      donor: insert.donor ?? null,
-      clientId: insert.clientId ?? null,
-      clientName: insert.clientName ?? null,
-      latitude: insert.latitude ?? null,
-      longitude: insert.longitude ?? null,
-      accuracy: insert.accuracy ?? null,
-      createdAt: now,
-    };
-    this.transactionsMap.set(tx.id, tx);
-    return tx;
-  }
-
-  // ─── Transaction Items ─────────────────────────────────────────────────
-
-  async getTransactionItems(
-    transactionId: string,
-  ): Promise<TransactionItem[]> {
-    return Array.from(this.transactionItemsMap.values()).filter(
-      (ti) => ti.transactionId === transactionId,
-    );
-  }
-
-  async createTransactionItem(
-    insert: InsertTransactionItem,
-  ): Promise<TransactionItem> {
-    const item: TransactionItem = {
-      id: randomUUID(),
-      transactionId: insert.transactionId,
-      inventoryItemId: insert.inventoryItemId,
-      name: insert.name,
-      quantity: insert.quantity,
-      weightPerUnitLbs: insert.weightPerUnitLbs,
-      valuePerUnitUsd: insert.valuePerUnitUsd,
-    };
-    this.transactionItemsMap.set(item.id, item);
-    return item;
-  }
-}
-
-export const storage = new MemStorage();
+/** Direct DB access for one-off maintenance tasks (backfill, migrations). */
+export const rawDb = db;

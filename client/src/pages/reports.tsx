@@ -1,21 +1,31 @@
 import React, { useMemo, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { useRepository } from "@/lib/repository";
+import { apiRequest } from "@/lib/queryClient";
+import { toApiInventoryBody, toApiClientBody } from "@/lib/api-types";
+import type { InventoryItem, ClientRecord, Transaction } from "@/lib/repository";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
+import { useToast } from "@/hooks/use-toast";
 
 export default function ReportsPage() {
   const repo = useRepository();
+  const qc = useQueryClient();
+  const { toast } = useToast();
   const [from, setFrom] = useState("");
   const [to, setTo] = useState("");
 
   const rangeTx = useMemo(() => {
     return repo.transactions.filter((tx) => {
-      const dateOnly = tx.timestamp.slice(0, 10);
+      if (tx.type !== "OUT") return false;
+      // Use local date for filtering so it matches the date picker values
+      const d = new Date(tx.timestamp);
+      const dateOnly = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
       if (from && dateOnly < from) return false;
       if (to && dateOnly > to) return false;
-      return tx.type === "OUT";
+      return true;
     });
   }, [repo.transactions, from, to]);
 
@@ -69,52 +79,105 @@ export default function ReportsPage() {
   }
 
   function exportCsv() {
-    const rows: string[] = [];
-    rows.push("type,timestamp,latitude,longitude,accuracy,client,clientIdentifier,itemName,quantity,weightPerUnitLbs,valuePerUnitUsd");
-    for (const tx of repo.transactions) {
-      const lat = tx.location?.latitude ?? "";
-      const long = tx.location?.longitude ?? "";
-      const acc = tx.location?.accuracy ?? "";
-      
-      for (const item of tx.items) {
-        const client = tx.clientName ?? "";
-        const clientRecord = tx.clientId ? repo.clients.find((c) => c.id === tx.clientId) : undefined;
-        const identifier = clientRecord?.identifier ?? "";
-        rows.push(
-          [
-            tx.type,
-            tx.timestamp,
-            lat,
-            long,
-            acc,
-            escapeCsv(client),
-            escapeCsv(identifier),
-            escapeCsv(item.name),
-            item.quantity.toString(),
-            item.weightPerUnitLbs.toString(),
-            item.valuePerUnitUsd.toString(),
-          ].join(","),
-        );
+    try {
+      const rows: string[] = [];
+      rows.push("type,timestamp,latitude,longitude,accuracy,client,clientIdentifier,itemName,quantity,weightPerUnitLbs,valuePerUnitUsd");
+      for (const tx of repo.transactions) {
+        const lat = tx.location?.latitude ?? "";
+        const long = tx.location?.longitude ?? "";
+        const acc = tx.location?.accuracy ?? "";
+
+        for (const item of tx.items) {
+          // Prefer stored clientName first (survives client deletion), fall back to lookup
+          const clientRecord = tx.clientId ? repo.clients.find((c) => c.id === tx.clientId) : undefined;
+          const client = tx.clientName ?? clientRecord?.name ?? "";
+          const identifier = clientRecord?.identifier ?? "";
+          rows.push(
+            [
+              tx.type,
+              tx.timestamp,
+              lat,
+              long,
+              acc,
+              escapeCsv(client),
+              escapeCsv(identifier),
+              escapeCsv(item.name),
+              item.quantity.toString(),
+              item.weightPerUnitLbs.toString(),
+              item.valuePerUnitUsd.toString(),
+            ].join(","),
+          );
+        }
       }
+      const blob = new Blob([rows.join("\n")], { type: "text/csv" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `frc-export-${new Date().toISOString().split("T")[0]}.csv`;
+      a.click();
+      URL.revokeObjectURL(url);
+      toast({ title: "Export complete", description: `Exported ${rows.length - 1} transaction rows.` });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "CSV export failed";
+      toast({ title: "Export failed", description: message, variant: "destructive" });
     }
-    const blob = new Blob([rows.join("\n")], { type: "text/csv" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = "morgan-state-repository-export.csv";
-    a.click();
-    URL.revokeObjectURL(url);
   }
 
   function handleImport(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
     if (!file) return;
     const reader = new FileReader();
-    reader.onload = () => {
+    reader.onload = async () => {
       try {
         const parsed = JSON.parse(String(reader.result));
-        window.localStorage.setItem("morgan-state-repository:v1", JSON.stringify(parsed));
-        window.location.reload();
+
+        // Import inventory items
+        const idMap = new Map<string, string>();
+        if (Array.isArray(parsed.inventory)) {
+          for (const item of parsed.inventory as InventoryItem[]) {
+            const res = await apiRequest("POST", "/api/inventory", toApiInventoryBody(item));
+            const created = await res.json();
+            idMap.set(item.id, created.id);
+          }
+        }
+
+        // Import clients
+        const clientIdMap = new Map<string, string>();
+        if (Array.isArray(parsed.clients)) {
+          for (const client of parsed.clients as ClientRecord[]) {
+            const res = await apiRequest("POST", "/api/clients", toApiClientBody(client));
+            const created = await res.json();
+            clientIdMap.set(client.id, created.id);
+          }
+        }
+
+        // Import transactions
+        if (Array.isArray(parsed.transactions)) {
+          for (const tx of parsed.transactions as Transaction[]) {
+            await apiRequest("POST", "/api/transactions", {
+              type: tx.type,
+              timestamp: tx.timestamp,
+              source: tx.source ?? null,
+              donor: tx.donor ?? null,
+              clientId: (tx.clientId && clientIdMap.get(tx.clientId)) ?? tx.clientId ?? null,
+              clientName: tx.clientName ?? null,
+              latitude: tx.location?.latitude ?? null,
+              longitude: tx.location?.longitude ?? null,
+              accuracy: tx.location?.accuracy ?? null,
+              items: tx.items.map((ti) => ({
+                inventoryItemId: idMap.get(ti.itemId) ?? ti.itemId,
+                name: ti.name,
+                quantity: ti.quantity,
+                weightPerUnitLbs: String(ti.weightPerUnitLbs),
+                valuePerUnitUsd: String(ti.valuePerUnitUsd),
+              })),
+            });
+          }
+        }
+
+        qc.invalidateQueries({ queryKey: ["/api/inventory"] });
+        qc.invalidateQueries({ queryKey: ["/api/clients"] });
+        qc.invalidateQueries({ queryKey: ["/api/transactions"] });
       } catch {
         alert("Could not import data. Ensure the JSON file is a valid export.");
       }

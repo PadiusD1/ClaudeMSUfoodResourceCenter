@@ -10,8 +10,15 @@ import CheckInPage from "@/pages/check-in";
 import CheckOutPage from "@/pages/check-out";
 import ClientsPage from "@/pages/clients";
 import ClientDetailPage from "@/pages/client-detail";
+import ItemGroupsPage from "@/pages/item-groups";
+import RequestsPage from "@/pages/requests";
 import ReportsPage from "@/pages/reports";
 import ActivityPage from "@/pages/activity";
+import SettingsPage from "@/pages/settings";
+import PublicRequestPage from "@/pages/public-request";
+import KioskPage from "@/pages/kiosk";
+import DonorsPage from "@/pages/donors";
+import DonorDetailPage from "@/pages/donor-detail";
 import { AppShell } from "@/components/layout/AppShell";
 import { RepositoryProvider } from "@/lib/repository";
 
@@ -24,8 +31,13 @@ function Router() {
       <Route path="/check-out" component={CheckOutPage} />
       <Route path="/clients" component={ClientsPage} />
       <Route path="/clients/:id" component={ClientDetailPage} />
+      <Route path="/donors/:id" component={DonorDetailPage} />
+      <Route path="/donors" component={DonorsPage} />
+      <Route path="/item-groups" component={ItemGroupsPage} />
+      <Route path="/requests" component={RequestsPage} />
       <Route path="/reports" component={ReportsPage} />
       <Route path="/activity" component={ActivityPage} />
+      <Route path="/settings" component={SettingsPage} />
       <Route component={NotFound} />
     </Switch>
   );
@@ -37,9 +49,19 @@ function App() {
       <TooltipProvider>
         <RepositoryProvider>
           <Toaster />
-          <AppShell>
-            <Router />
-          </AppShell>
+          <Switch>
+            <Route path="/portal">
+              <PublicRequestPage />
+            </Route>
+            <Route path="/kiosk">
+              <KioskPage />
+            </Route>
+            <Route>
+              <AppShell>
+                <Router />
+              </AppShell>
+            </Route>
+          </Switch>
         </RepositoryProvider>
       </TooltipProvider>
     </QueryClientProvider>

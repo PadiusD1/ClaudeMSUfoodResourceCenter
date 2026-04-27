@@ -1,14 +1,26 @@
 import React, { useMemo, useState, useRef } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { useRepository, getCurrentLocation } from "@/lib/repository";
+import { lookupBarcode, type EnrichedProduct } from "@/lib/barcode-lookup";
+import { toInventoryItem, type ApiInventoryItem } from "@/lib/api-types";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { useToast } from "@/hooks/use-toast";
-import { Import, SearchIcon, XIcon } from "lucide-react";
+import { Import, SearchIcon, XIcon, Loader2, CheckCircle2, AlertCircle, Package, Scale, DollarSign, ShieldCheck } from "lucide-react";
+
+type ScanState =
+  | { phase: "idle" }
+  | { phase: "scanning" }
+  | { phase: "found-existing"; itemName: string }
+  | { phase: "found-created"; itemName: string; source: string; product: EnrichedProduct }
+  | { phase: "not-found" }
+  | { phase: "error"; message: string };
 
 export default function CheckInPage() {
-  const { inventory, addOrUpdateItem, recordInbound, barcodeCache, upsertBarcodeCache, sources, donors, addSource, addDonor } = useRepository();
+  const { inventory, addOrUpdateItem, recordInbound, upsertBarcodeCache, sources, donors, addSource, addDonor, categories, addCategory } = useRepository();
+  const queryClient = useQueryClient();
   const { toast } = useToast();
 
   const [mode, setMode] = useState<"existing" | "new">("existing");
@@ -18,11 +30,15 @@ export default function CheckInPage() {
   const [donor, setDonor] = useState("");
   const [isNewSource, setIsNewSource] = useState(false);
   const [isNewDonor, setIsNewDonor] = useState(false);
+  const [isNewCategory, setIsNewCategory] = useState(false);
+  const [customCategory, setCustomCategory] = useState("");
+  const [scanState, setScanState] = useState<ScanState>({ phase: "idle" });
 
   const [newItem, setNewItem] = useState({
     name: "",
     category: "Uncategorized",
     barcode: "",
+    brand: "",
     weightPerUnitLbs: 0,
     valuePerUnitUsd: 0,
     allergens: [] as string[],
@@ -34,74 +50,82 @@ export default function CheckInPage() {
     [inventory],
   );
 
+  // Get the currently selected item for enrichment display
+  const selectedItem = useMemo(
+    () => (selectedId ? inventory.find((i) => i.id === selectedId) : undefined),
+    [selectedId, inventory],
+  );
+
   async function handleBarcodeLookup(code: string) {
     const trimmed = code.trim();
     if (!trimmed) return;
 
-    // 1. Global Lookup (Open Food Facts)
+    setScanState({ phase: "scanning" });
+
     try {
-      const res = await fetch(`https://world.openfoodfacts.org/api/v0/product/${trimmed}.json`);
-      if (res.ok) {
-        const data = await res.json();
-        if (data.status === 1) {
-          const p = data.product;
-          const name = p.product_name || p.generic_name || "";
-          const category = (Array.isArray(p.categories_tags) && p.categories_tags[0]?.split(":").pop()) || "Uncategorized";
-          const grams = p.product_quantity && p.product_quantity_unit === "g" ? Number(p.product_quantity) : undefined;
-          const weight = grams && !isNaN(grams) ? grams / 453.592 : 0;
-          const allergens = (p.allergens_tags || []).map((a: string) => a.split(":").pop()?.replace(/-/g, " ") || a);
+      const result = await lookupBarcode(trimmed);
 
-          upsertBarcodeCache(trimmed, { name, category, weightPerUnitLbs: weight, allergens });
-
-          // If in 'new' mode, prefill
-          if (mode === "new") {
-            setNewItem(prev => ({
-              ...prev,
-              name: name || prev.name,
-              category: category || prev.category,
-              barcode: trimmed,
-              weightPerUnitLbs: weight || prev.weightPerUnitLbs,
-              allergens: allergens.length ? allergens : prev.allergens
-            }));
-            toast({ title: "Product found", description: "Details prefilled from global database." });
-            return; // Done
-          }
-        }
+      if (result.status === "debounced") {
+        setScanState({ phase: "idle" });
+        return;
       }
-    } catch (e) {
-      // Ignore network errors, fall through
-    }
 
-    // 2. Local Inventory Fallback
-    const existing = inventory.find((i) => i.barcode === trimmed);
-    if (existing) {
-      setMode("existing");
-      setSelectedId(existing.id);
-      toast({ title: "Item found", description: `Selected ${existing.name} from inventory.` });
-      quantityInputRef.current?.focus();
-      return;
-    }
+      if (result.status === "exists") {
+        const item = toInventoryItem(result.item as ApiInventoryItem);
+        setMode("existing");
+        setSelectedId(item.id);
+        setScanState({ phase: "found-existing", itemName: item.name });
+        toast({
+          title: "Item already exists",
+          description: `${item.name} is already in inventory (${item.quantity} on hand). Set quantity to add.`,
+        });
+        queryClient.invalidateQueries({ queryKey: ["/api/inventory"] });
+        setTimeout(() => quantityInputRef.current?.focus(), 100);
+        return;
+      }
 
-    // 3. Local Cache Fallback
-    const cached = barcodeCache[trimmed];
-    if (cached) {
+      if (result.status === "created") {
+        const item = toInventoryItem(result.item as ApiInventoryItem);
+        upsertBarcodeCache(trimmed, {
+          name: item.name,
+          category: item.category,
+          weightPerUnitLbs: item.weightPerUnitLbs,
+          allergens: item.allergens,
+        });
+        queryClient.invalidateQueries({ queryKey: ["/api/inventory"] });
+        setMode("existing");
+        setSelectedId(item.id);
+        setScanState({
+          phase: "found-created",
+          itemName: item.name,
+          source: result.product.winningSource,
+          product: result.product,
+        });
+        toast({
+          title: "New item added automatically",
+          description: `${item.name} found via ${result.product.winningSource} and added to inventory. Set quantity to receive.`,
+        });
+        setTimeout(() => quantityInputRef.current?.focus(), 100);
+        return;
+      }
+
+      // Not found in any API
       setMode("new");
-      setNewItem({
-        name: cached.name || "",
-        category: cached.category || "Uncategorized",
-        barcode: trimmed,
-        weightPerUnitLbs: cached.weightPerUnitLbs || 0,
-        valuePerUnitUsd: 0,
-        allergens: cached.allergens || [],
+      setNewItem(prev => ({ ...prev, barcode: trimmed }));
+      setScanState({ phase: "not-found" });
+      toast({
+        title: "Barcode not recognized",
+        description: "No match found in any product database. Please enter details manually.",
       });
-      toast({ title: "Item found in cache", description: "Details prefilled from local cache." });
-      return;
+    } catch (err) {
+      setScanState({ phase: "error", message: String(err) });
+      setMode("new");
+      setNewItem(prev => ({ ...prev, barcode: trimmed }));
+      toast({
+        title: "Lookup failed",
+        description: "Could not reach product databases. Please enter details manually.",
+      });
     }
-
-    // 4. Not found anywhere
-    setMode("new");
-    setNewItem(prev => ({ ...prev, barcode: trimmed }));
-    toast({ title: "New item", description: "Barcode not found. Please enter details." });
   }
 
   async function handleSubmit(e: React.FormEvent) {
@@ -124,9 +148,15 @@ export default function CheckInPage() {
         });
         return;
       }
+      const finalCategory = newItem.category.trim() || "Uncategorized";
+      // Save custom category for future use
+      if (finalCategory !== "Uncategorized" && !categories.includes(finalCategory)) {
+        addCategory(finalCategory);
+      }
       const created = addOrUpdateItem({
         name: newItem.name.trim(),
-        category: newItem.category.trim() || "Uncategorized",
+        brand: newItem.brand?.trim() || undefined,
+        category: finalCategory,
         barcode: newItem.barcode?.trim() || undefined,
         quantity: 0,
         weightPerUnitLbs: newItem.weightPerUnitLbs,
@@ -134,6 +164,15 @@ export default function CheckInPage() {
         allergens: newItem.allergens,
       });
       itemId = created.id;
+      // Cache barcode so future scans remember all saved info
+      if (newItem.barcode?.trim()) {
+        upsertBarcodeCache(newItem.barcode.trim(), {
+          name: newItem.name.trim(),
+          category: finalCategory,
+          weightPerUnitLbs: newItem.weightPerUnitLbs,
+          allergens: newItem.allergens,
+        });
+      }
     }
 
     if (!itemId) return;
@@ -161,10 +200,7 @@ export default function CheckInPage() {
     });
 
     setQuantity(0);
-    // Keep source/donor settings for subsequent scans in the same batch
-    // Don't reset selectedId or new item details aggressively so they can add more batches if needed,
-    // but typically reset quantity is enough.
-    // If it was new, switch to existing for that item?
+    setScanState({ phase: "idle" });
     if (mode === "new") {
       setMode("existing");
       setSelectedId(itemId);
@@ -172,10 +208,13 @@ export default function CheckInPage() {
         name: "",
         category: "Uncategorized",
         barcode: "",
+        brand: "",
         weightPerUnitLbs: 0,
         valuePerUnitUsd: 0,
         allergens: [],
       });
+      setIsNewCategory(false);
+      setCustomCategory("");
     }
   }
 
@@ -191,6 +230,9 @@ export default function CheckInPage() {
         <div className="mb-6">
            <div className="relative">
             <SearchIcon className="pointer-events-none absolute left-2 top-2.5 h-4 w-4 text-muted-foreground" />
+            {scanState.phase === "scanning" && (
+              <Loader2 className="absolute right-2 top-2.5 h-4 w-4 animate-spin text-muted-foreground" />
+            )}
             <Input
               type="search"
               placeholder="Scan barcode to find or add..."
@@ -202,14 +244,66 @@ export default function CheckInPage() {
                   e.currentTarget.value = "";
                 }
               }}
+              disabled={scanState.phase === "scanning"}
               autoFocus
               data-testid="input-checkin-barcode-scan"
             />
           </div>
-          <p className="text-[11px] text-muted-foreground mt-1 ml-1">
-            USB Scanner: Focus this field and scan. Enter key triggers lookup.
-          </p>
+
+          {/* Scan status feedback */}
+          {scanState.phase === "scanning" && (
+            <p className="text-[11px] text-muted-foreground mt-1 ml-1 flex items-center gap-1">
+              <Loader2 className="h-3 w-3 animate-spin" />
+              Looking up barcode across product databases...
+            </p>
+          )}
+          {scanState.phase === "found-existing" && (
+            <p className="text-[11px] text-emerald-600 mt-1 ml-1 flex items-center gap-1">
+              <CheckCircle2 className="h-3 w-3" />
+              Already in inventory: {scanState.itemName}. Enter quantity below.
+            </p>
+          )}
+          {scanState.phase === "found-created" && (
+            <div className="mt-1 ml-1 space-y-1">
+              <p className="text-[11px] text-emerald-600 flex items-center gap-1">
+                <CheckCircle2 className="h-3 w-3" />
+                Auto-added: {scanState.itemName} (via {scanState.source}). Enter quantity below.
+              </p>
+              {/* Enrichment summary */}
+              <EnrichmentBadges product={scanState.product} />
+            </div>
+          )}
+          {scanState.phase === "not-found" && (
+            <p className="text-[11px] text-amber-600 mt-1 ml-1 flex items-center gap-1">
+              <AlertCircle className="h-3 w-3" />
+              Not found in any database. Fill in details manually below.
+            </p>
+          )}
+          {scanState.phase === "error" && (
+            <p className="text-[11px] text-red-600 mt-1 ml-1 flex items-center gap-1">
+              <AlertCircle className="h-3 w-3" />
+              Lookup failed. Fill in details manually.
+            </p>
+          )}
+          {scanState.phase === "idle" && (
+            <p className="text-[11px] text-muted-foreground mt-1 ml-1">
+              USB Scanner: Focus this field and scan. Enter key triggers auto-lookup.
+            </p>
+          )}
         </div>
+
+        {/* Enrichment details for selected existing item */}
+        {mode === "existing" && selectedItem && (
+          selectedItem.winningSource || selectedItem.brand ||
+          (selectedItem.weightPerUnitLbs && selectedItem.weightPerUnitLbs > 0) ||
+          (selectedItem.netWeightG && selectedItem.netWeightG > 0) ||
+          (selectedItem.allergens && selectedItem.allergens.length > 0) ||
+          (selectedItem.costCents && selectedItem.costCents > 0)
+        ) && (
+          <div className="mb-4 p-3 bg-muted/50 rounded-lg border border-dashed">
+            <ItemEnrichmentDetails item={selectedItem} />
+          </div>
+        )}
 
         <form onSubmit={handleSubmit} className="space-y-4 border-t pt-4 border-dashed">
           <div className="flex gap-2">
@@ -248,7 +342,7 @@ export default function CheckInPage() {
                 <SelectContent>
                   {sortedInventory.map((item) => (
                     <SelectItem key={item.id} value={item.id} data-testid={`option-existing-item-${item.id}`}>
-                      {item.name} • {item.quantity} on hand
+                      {item.brand ? `${item.brand} - ` : ""}{item.name} • {item.quantity} on hand
                     </SelectItem>
                   ))}
                 </SelectContent>
@@ -256,29 +350,96 @@ export default function CheckInPage() {
             </div>
           ) : (
             <div className="space-y-3">
-              <div className="space-y-1.5">
-                <label className="text-sm font-medium" htmlFor="new-name" data-testid="label-new-item-name">
-                  Item name
-                </label>
-                <Input
-                  id="new-name"
-                  value={newItem.name}
-                  onChange={(e) => setNewItem((p) => ({ ...p, name: e.target.value }))}
-                  data-testid="input-new-item-name"
-                  required
-                />
+              <div className="grid gap-3 md:grid-cols-2">
+                <div className="space-y-1.5">
+                  <label className="text-sm font-medium" htmlFor="new-name" data-testid="label-new-item-name">
+                    Item name
+                  </label>
+                  <Input
+                    id="new-name"
+                    value={newItem.name}
+                    onChange={(e) => setNewItem((p) => ({ ...p, name: e.target.value }))}
+                    data-testid="input-new-item-name"
+                    required
+                  />
+                </div>
+                <div className="space-y-1.5">
+                  <label className="text-sm font-medium" htmlFor="new-brand" data-testid="label-new-item-brand">
+                    Brand (optional)
+                  </label>
+                  <Input
+                    id="new-brand"
+                    value={newItem.brand}
+                    onChange={(e) => setNewItem((p) => ({ ...p, brand: e.target.value }))}
+                    data-testid="input-new-item-brand"
+                  />
+                </div>
               </div>
               <div className="grid gap-3 md:grid-cols-2">
                 <div className="space-y-1.5">
                   <label className="text-sm font-medium" htmlFor="new-category" data-testid="label-new-item-category">
                     Category
                   </label>
-                  <Input
-                    id="new-category"
-                    value={newItem.category}
-                    onChange={(e) => setNewItem((p) => ({ ...p, category: e.target.value }))}
-                    data-testid="input-new-item-category"
-                  />
+                  {!isNewCategory ? (
+                    <Select
+                      value={newItem.category}
+                      onValueChange={(val) => {
+                        if (val === "__new_category__") {
+                          setIsNewCategory(true);
+                          setCustomCategory("");
+                        } else {
+                          setNewItem((p) => ({ ...p, category: val }));
+                        }
+                      }}
+                    >
+                      <SelectTrigger id="new-category" data-testid="select-new-item-category">
+                        <SelectValue placeholder="Select category" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {categories.map((cat) => (
+                          <SelectItem key={cat} value={cat}>{cat}</SelectItem>
+                        ))}
+                        <SelectItem value="__new_category__">+ Add New Category</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  ) : (
+                    <div className="flex gap-1">
+                      <Input
+                        value={customCategory}
+                        onChange={(e) => setCustomCategory(e.target.value)}
+                        onBlur={() => {
+                          if (customCategory.trim()) {
+                            setNewItem((p) => ({ ...p, category: customCategory.trim() }));
+                          }
+                        }}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") {
+                            e.preventDefault();
+                            if (customCategory.trim()) {
+                              setNewItem((p) => ({ ...p, category: customCategory.trim() }));
+                              setIsNewCategory(false);
+                            }
+                          }
+                        }}
+                        placeholder="Enter new category"
+                        autoFocus
+                        data-testid="input-new-item-category-custom"
+                      />
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon"
+                        onClick={() => {
+                          if (customCategory.trim()) {
+                            setNewItem((p) => ({ ...p, category: customCategory.trim() }));
+                          }
+                          setIsNewCategory(false);
+                        }}
+                      >
+                        <XIcon className="h-4 w-4" />
+                      </Button>
+                    </div>
+                  )}
                 </div>
                 <div className="space-y-1.5">
                   <label className="text-sm font-medium" htmlFor="new-barcode" data-testid="label-new-item-barcode">
@@ -368,9 +529,9 @@ export default function CheckInPage() {
                   </Select>
                 ) : (
                     <div className="flex gap-1 w-full">
-                        <Input 
-                            value={source} 
-                            onChange={(e) => setSource(e.target.value)} 
+                        <Input
+                            value={source}
+                            onChange={(e) => setSource(e.target.value)}
                             placeholder="Enter new source"
                             autoFocus
                         />
@@ -383,7 +544,7 @@ export default function CheckInPage() {
               </div>
             </div>
           </div>
-          
+
           {source === "Donation" && (
               <div className="space-y-1.5 border-l-2 border-indigo-100 pl-4 mt-2">
                   <div className="relative">
@@ -412,9 +573,9 @@ export default function CheckInPage() {
                         </Select>
                     ) : (
                         <div className="flex gap-1 w-full">
-                            <Input 
-                                value={donor} 
-                                onChange={(e) => setDonor(e.target.value)} 
+                            <Input
+                                value={donor}
+                                onChange={(e) => setDonor(e.target.value)}
                                 placeholder="Enter new donor"
                                 autoFocus
                             />
@@ -439,5 +600,123 @@ export default function CheckInPage() {
         </form>
       </CardContent>
     </Card>
+  );
+}
+
+// ─── Enrichment Badges (shown after auto-create) ────────────────────────────
+
+function EnrichmentBadges({ product }: { product: EnrichedProduct }) {
+  const badges: { icon: React.ReactNode; label: string; detail: string; color: string }[] = [];
+
+  // Confidence
+  const conf = Math.round(product.matchConfidence * 100);
+  badges.push({
+    icon: <ShieldCheck className="h-3 w-3" />,
+    label: `${conf}%`,
+    detail: `Match confidence`,
+    color: conf >= 80 ? "text-emerald-700 bg-emerald-50" : conf >= 60 ? "text-amber-700 bg-amber-50" : "text-red-700 bg-red-50",
+  });
+
+  // Package type
+  if (product.packageType !== "single") {
+    const typeLabel = product.packageType.replace(/_/g, " ");
+    badges.push({
+      icon: <Package className="h-3 w-3" />,
+      label: `${typeLabel} (${product.unitCount})`,
+      detail: `Package type`,
+      color: "text-blue-700 bg-blue-50",
+    });
+  }
+
+  // Weight
+  if (product.netWeightG) {
+    const wLabel = product.netWeightG >= 1000
+      ? `${(product.netWeightG / 1000).toFixed(1)}kg`
+      : `${Math.round(product.netWeightG)}g`;
+    badges.push({
+      icon: <Scale className="h-3 w-3" />,
+      label: `${wLabel}${product.weightIsEstimated ? " ~est" : ""}`,
+      detail: `Net weight`,
+      color: product.weightIsEstimated ? "text-amber-700 bg-amber-50" : "text-slate-700 bg-slate-50",
+    });
+  }
+
+  // Cost
+  if (product.costCents) {
+    badges.push({
+      icon: <DollarSign className="h-3 w-3" />,
+      label: `$${(product.costCents / 100).toFixed(2)}${product.costIsEstimated ? " ~est" : ""}`,
+      detail: `Unit cost`,
+      color: product.costIsEstimated ? "text-amber-700 bg-amber-50" : "text-slate-700 bg-slate-50",
+    });
+  }
+
+  if (badges.length === 0) return null;
+
+  return (
+    <div className="flex flex-wrap gap-1.5 mt-1">
+      {badges.map((b, i) => (
+        <span
+          key={i}
+          className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium ${b.color}`}
+          title={b.detail}
+        >
+          {b.icon}
+          {b.label}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+// ─── Item Enrichment Details (shown for selected existing item) ─────────────
+
+function ItemEnrichmentDetails({ item }: { item: { brand?: string; packageType?: string; unitCount?: number; netWeightG?: number; unitWeightG?: number; weightIsEstimated?: boolean; weightPerUnitLbs?: number; costCents?: number; costIsEstimated?: boolean; valuePerUnitUsd?: number; winningSource?: string; matchConfidence?: number; currency?: string; allergens?: string[] } }) {
+  const details: string[] = [];
+
+  if (item.brand) details.push(`Brand: ${item.brand}`);
+
+  if (item.packageType && item.packageType !== "single") {
+    details.push(`Package: ${item.packageType.replace(/_/g, " ")} (${item.unitCount ?? 1} units)`);
+  }
+
+  if (item.netWeightG) {
+    const w = item.netWeightG >= 1000
+      ? `${(item.netWeightG / 1000).toFixed(1)}kg`
+      : `${Math.round(item.netWeightG)}g`;
+    details.push(`Weight: ${w}${item.weightIsEstimated ? " (estimated)" : ""}`);
+    if (item.unitWeightG && item.unitCount && item.unitCount > 1) {
+      const uw = item.unitWeightG >= 1000
+        ? `${(item.unitWeightG / 1000).toFixed(1)}kg`
+        : `${Math.round(item.unitWeightG)}g`;
+      details.push(`Per unit: ${uw}`);
+    }
+  } else if (item.weightPerUnitLbs && item.weightPerUnitLbs > 0) {
+    details.push(`Weight: ${item.weightPerUnitLbs.toFixed(2)} lbs/unit`);
+  }
+
+  if (item.costCents) {
+    details.push(`Cost: $${(item.costCents / 100).toFixed(2)}${item.costIsEstimated ? " (estimated)" : ""}`);
+  } else if (item.valuePerUnitUsd && item.valuePerUnitUsd > 0) {
+    details.push(`Value: $${Number(item.valuePerUnitUsd).toFixed(2)}/unit`);
+  }
+
+  if (item.allergens && item.allergens.length > 0) {
+    details.push(`Allergens: ${item.allergens.join(", ")}`);
+  }
+
+  if (item.winningSource) {
+    const conf = item.matchConfidence ? ` (${Math.round(item.matchConfidence * 100)}% confidence)` : "";
+    details.push(`Source: ${item.winningSource}${conf}`);
+  }
+
+  if (details.length === 0) return null;
+
+  return (
+    <div className="text-[11px] text-muted-foreground space-y-0.5">
+      {details.map((d, i) => (
+        <p key={i}>{d}</p>
+      ))}
+    </div>
   );
 }

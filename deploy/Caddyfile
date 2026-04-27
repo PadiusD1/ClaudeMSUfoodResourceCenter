@@ -1,0 +1,11 @@
+# Option A: HTTPS with self-signed cert (automatic)
+# Replace with your server's hostname or IP
+https://pantry.morgan.local {
+  tls internal
+  reverse_proxy localhost:5000
+}
+
+# Option B: Plain HTTP on port 80 (simpler, uncomment below and comment above)
+# :80 {
+#   reverse_proxy localhost:5000
+# }

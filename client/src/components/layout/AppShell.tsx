@@ -4,7 +4,7 @@ import { SidebarProvider, Sidebar, SidebarContent, SidebarGroup, SidebarGroupLab
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
-import { BoxesIcon, ClipboardListIcon, FileTextIcon, HistoryIcon, HomeIcon, PackageIcon, ShoppingCartIcon, UsersIcon } from "lucide-react";
+import { BoxesIcon, ClipboardListIcon, ExternalLinkIcon, FileTextIcon, HeartHandshakeIcon, HistoryIcon, HomeIcon, InboxIcon, LayersIcon, MonitorIcon, PackageIcon, SettingsIcon, ShoppingCartIcon, UsersIcon } from "lucide-react";
 
 const navItems = [
   { href: "/", label: "Dashboard", icon: HomeIcon, testId: "nav-dashboard" },
@@ -12,8 +12,12 @@ const navItems = [
   { href: "/check-in", label: "Check-In", icon: ClipboardListIcon, testId: "nav-check-in" },
   { href: "/check-out", label: "Check-Out", icon: ShoppingCartIcon, testId: "nav-check-out" },
   { href: "/clients", label: "Clients", icon: UsersIcon, testId: "nav-clients" },
+  { href: "/donors", label: "Donors", icon: HeartHandshakeIcon, testId: "nav-donors" },
+  { href: "/item-groups", label: "Item Groups", icon: LayersIcon, testId: "nav-item-groups" },
+  { href: "/requests", label: "Requests", icon: InboxIcon, testId: "nav-requests" },
   { href: "/reports", label: "Reports", icon: FileTextIcon, testId: "nav-reports" },
   { href: "/activity", label: "Activity / History", icon: HistoryIcon, testId: "nav-activity" },
+  { href: "/settings", label: "Settings", icon: SettingsIcon, testId: "nav-settings" },
 ];
 
 export function AppShell({ children }: { children: React.ReactNode }) {
@@ -35,7 +39,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
                 Morgan State Repository
               </span>
               <span className="text-[11px] text-sidebar-foreground/70" data-testid="text-app-tagline">
-                Food Pantry Inventory System
+                Food Resource Center
               </span>
             </div>
             <div className="ml-auto flex items-center gap-1">
@@ -70,7 +74,21 @@ export function AppShell({ children }: { children: React.ReactNode }) {
               })}
             </SidebarMenu>
           </SidebarGroup>
-          <div className="mt-auto p-3 pt-1">
+          <div className="mt-auto p-3 pt-1 space-y-2">
+            <div className="flex gap-2">
+              <Button asChild variant="default" size="sm" className="flex-1 text-xs">
+                <a href="/portal" target="_blank" rel="noopener">
+                  <ExternalLinkIcon className="h-3 w-3 mr-1" />
+                  Student Portal
+                </a>
+              </Button>
+              <Button asChild variant="outline" size="sm" className="flex-1 text-xs">
+                <a href="/kiosk" target="_blank" rel="noopener">
+                  <MonitorIcon className="h-3 w-3 mr-1" />
+                  Kiosk Mode
+                </a>
+              </Button>
+            </div>
             <Card className="glass-panel border-dashed border-sidebar-border/70 px-3 py-2.5">
               <div className="flex items-start justify-between gap-3">
                 <div className="space-y-0.5">
@@ -130,8 +148,12 @@ function pageTitleForPath(path: string) {
   if (path.startsWith("/check-in")) return "Check-In (Receiving)";
   if (path.startsWith("/check-out")) return "Check-Out (Distribution)";
   if (path.startsWith("/clients")) return "Clients";
+  if (path.startsWith("/donors")) return "Donors";
+  if (path.startsWith("/item-groups")) return "Item Groups";
+  if (path.startsWith("/requests")) return "Requests";
   if (path.startsWith("/reports")) return "Reports";
   if (path.startsWith("/activity")) return "Activity & History";
+  if (path.startsWith("/settings")) return "Settings";
   return "Dashboard";
 }
 
@@ -140,7 +162,11 @@ function pageSubtitleForPath(path: string) {
   if (path.startsWith("/check-in")) return "Receive new product into inventory and log sources.";
   if (path.startsWith("/check-out")) return "Build distribution carts, track visits, and decrement stock.";
   if (path.startsWith("/clients")) return "Maintain client records and visit history with gentle frequency checks.";
+  if (path.startsWith("/donors")) return "Track donor profiles, donation history, and generate donor reports.";
+  if (path.startsWith("/item-groups")) return "Create pre-built distribution bundles for quick check-out.";
+  if (path.startsWith("/requests")) return "Review and manage item requests from students and visitors.";
   if (path.startsWith("/reports")) return "Generate inventory and distribution summaries for any date range.";
   if (path.startsWith("/activity")) return "Browse and filter the full transaction log across IN and OUT moves.";
+  if (path.startsWith("/settings")) return "Configure organization details, visit policies, and system preferences.";
   return "At-a-glance overview of pantry stock, clients, and activity.";
 }

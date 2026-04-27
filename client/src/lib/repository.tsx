@@ -1,15 +1,51 @@
-import React, { createContext, useContext, useEffect, useMemo, useState } from "react";
+import React, { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { apiRequest } from "./queryClient";
+import {
+  toInventoryItem,
+  toClientRecord,
+  toTransaction,
+  toApiInventoryBody,
+  toApiClientBody,
+  type ApiInventoryItem,
+  type ApiClient,
+  type ApiTransaction,
+} from "./api-types";
+
+export type PackageType = "single" | "multi_pack" | "variety_pack" | "case";
 
 export type InventoryItem = {
   id: string;
   name: string;
+  brand?: string;
   category: string;
   barcode?: string;
   quantity: number;
+
+  // Package
+  packageType?: PackageType;
+  unitCount?: number;
+
+  // Weight
   weightPerUnitLbs: number;
+  netWeightG?: number;
+  unitWeightG?: number;
+  weightIsEstimated?: boolean;
+
+  // Cost
   valuePerUnitUsd: number;
+  costCents?: number;
+  costIsEstimated?: boolean;
+  currency?: string;
+
+  // Metadata
   reorderThreshold?: number;
   allergens?: string[];
+
+  // Data provenance
+  winningSource?: string;
+  matchConfidence?: number;
+
   createdAt: string;
   updatedAt: string;
 };
@@ -19,6 +55,14 @@ export type ClientRecord = {
   name: string;
   identifier: string;
   contact?: string;
+  phone?: string;
+  email?: string;
+  address?: string;
+  dateOfBirth?: string;
+  householdSize?: number;
+  eligibleDate?: string;
+  certificationDate?: string;
+  status?: string;
   allergies?: string[];
   notes?: string;
   createdAt: string;
@@ -73,48 +117,8 @@ export type RepositoryState = {
   barcodeCache: Record<string, BarcodeCacheEntry>;
   sources: string[];
   donors: string[];
+  categories: string[];
 };
-
-const STORAGE_KEY = "morgan-state-repository:v1";
-
-const defaultState: RepositoryState = {
-  inventory: [],
-  clients: [],
-  transactions: [],
-  settings: {
-    visitWarningDays: 7,
-  },
-  barcodeCache: {},
-  sources: ["Donation", "Purchase", "Transfer", "Other"],
-  donors: ["Morgan State University", "Maryland Food Bank", "Local Grocery"],
-};
-
-function loadState(): RepositoryState {
-  if (typeof window === "undefined") return defaultState;
-  try {
-    const raw = window.localStorage.getItem(STORAGE_KEY);
-    if (!raw) return defaultState;
-    const parsed = JSON.parse(raw) as RepositoryState;
-    return {
-      ...defaultState,
-      ...parsed,
-    };
-  } catch {
-    return defaultState;
-  }
-}
-
-function saveState(state: RepositoryState) {
-  try {
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-  } catch {
-    // ignore
-  }
-}
-
-function uuid() {
-  return crypto.randomUUID();
-}
 
 export type RepositoryContextValue = RepositoryState & {
   addOrUpdateItem: (partial: Partial<InventoryItem> & { name: string }) => InventoryItem;
@@ -138,259 +142,617 @@ export type RepositoryContextValue = RepositoryState & {
   upsertBarcodeCache: (barcode: string, entry: Omit<BarcodeCacheEntry, "cachedAt">) => void;
   addSource: (source: string) => void;
   addDonor: (donor: string) => void;
+  categories: string[];
+  addCategory: (category: string) => void;
 };
+
+// ─── localStorage helpers for client-only state ────────────────────────────
+
+const LOCAL_KEY = "morgan-local-settings:v1";
+
+type LocalState = {
+  settings: Settings;
+  barcodeCache: Record<string, BarcodeCacheEntry>;
+  sources: string[];
+  donors: string[];
+  categories: string[];
+};
+
+const defaultLocal: LocalState = {
+  settings: { visitWarningDays: 7 },
+  barcodeCache: {},
+  sources: ["Donation", "Purchase", "Transfer", "Other"],
+  donors: ["Morgan State University", "Maryland Food Bank", "Local Grocery"],
+  categories: [
+    "Beverages",
+    "Bread & Bakery",
+    "Canned Goods",
+    "Cereals & Breakfast",
+    "Condiments & Sauces",
+    "Dairy & Eggs",
+    "Frozen Foods",
+    "Grains & Pasta",
+    "Meat & Poultry",
+    "Produce",
+    "Snacks",
+    "Baby Food",
+    "Personal Care",
+    "Household",
+    "Other",
+  ],
+};
+
+function loadLocal(): LocalState {
+  if (typeof window === "undefined") return defaultLocal;
+  try {
+    const raw = window.localStorage.getItem(LOCAL_KEY);
+    if (!raw) return defaultLocal;
+    return { ...defaultLocal, ...JSON.parse(raw) };
+  } catch {
+    return defaultLocal;
+  }
+}
+
+function saveLocal(state: LocalState) {
+  try {
+    window.localStorage.setItem(LOCAL_KEY, JSON.stringify(state));
+  } catch {
+    // ignore
+  }
+}
+
+function uuid() {
+  return crypto.randomUUID();
+}
+
+// ─── Context ────────────────────────────────────────────────────────────────
 
 const RepositoryContext = createContext<RepositoryContextValue | null>(null);
 
 export function RepositoryProvider({ children }: { children: React.ReactNode }) {
-  const [state, setState] = useState<RepositoryState>(() => loadState());
+  const queryClient = useQueryClient();
 
-  useEffect(() => {
-    saveState(state);
-  }, [state]);
+  // ── API queries ─────────────────────────────────────────────────────────
+  const inventoryQuery = useQuery<ApiInventoryItem[]>({
+    queryKey: ["/api/inventory"],
+  });
 
-  const value = useMemo<RepositoryContextValue>(() => {
-    function addOrUpdateItem(partial: Partial<InventoryItem> & { name: string }): InventoryItem {
-      const now = new Date().toISOString();
-      let existing =
-        (partial.id && state.inventory.find((i) => i.id === partial.id)) ||
-        (partial.barcode
-          ? state.inventory.find((i) => i.barcode && i.barcode === partial.barcode)
-          : undefined);
+  const clientsQuery = useQuery<ApiClient[]>({
+    queryKey: ["/api/clients"],
+  });
 
-      if (existing) {
-        const updated: InventoryItem = {
-          ...existing,
-          ...partial,
-          updatedAt: now,
-        };
-        setState((prev) => ({
-          ...prev,
-          inventory: prev.inventory.map((i) => (i.id === existing!.id ? updated : i)),
-        }));
-        return updated;
-      }
+  const transactionsQuery = useQuery<ApiTransaction[]>({
+    queryKey: ["/api/transactions"],
+  });
 
-      const item: InventoryItem = {
-        id: partial.id ?? uuid(),
-        name: partial.name,
-        category: partial.category ?? "Uncategorized",
-        barcode: partial.barcode?.trim() || undefined,
-        quantity: partial.quantity ?? 0,
-        weightPerUnitLbs: partial.weightPerUnitLbs ?? 0,
-        valuePerUnitUsd: partial.valuePerUnitUsd ?? 0,
-        reorderThreshold: partial.reorderThreshold,
-        allergens: partial.allergens,
-        createdAt: now,
-        updatedAt: now,
-      };
+  // ── Adapted data ────────────────────────────────────────────────────────
+  const inventory = useMemo(
+    () => (inventoryQuery.data ?? []).map(toInventoryItem),
+    [inventoryQuery.data],
+  );
 
-      setState((prev) => ({ ...prev, inventory: [...prev.inventory, item] }));
-      return item;
+  const clients = useMemo(
+    () => (clientsQuery.data ?? []).map(toClientRecord),
+    [clientsQuery.data],
+  );
+
+  const transactions = useMemo(
+    () => (transactionsQuery.data ?? []).map(toTransaction),
+    [transactionsQuery.data],
+  );
+
+  // ── Client-only localStorage state ──────────────────────────────────────
+  const [local, setLocal] = useState<LocalState>(loadLocal);
+  useEffect(() => { saveLocal(local); }, [local]);
+
+  // ── Pending item creates: temp ID → Promise<server ID> ─────────────────
+  const pendingCreates = useRef<Map<string, Promise<string>>>(new Map());
+
+  // ── Pending client creates: temp ID → Promise<server ID> ──────────────
+  const pendingClientCreates = useRef<Map<string, Promise<string>>>(new Map());
+
+  // ── Resolve an item ID: if it's a pending temp ID, await the real one ──
+  async function resolveItemId(id: string): Promise<string> {
+    const pending = pendingCreates.current.get(id);
+    if (pending) return pending;
+    return id;
+  }
+
+  // ── Resolve a client ID: if it's a pending temp ID, await the real one ──
+  async function resolveClientId(id: string): Promise<string> {
+    const pending = pendingClientCreates.current.get(id);
+    if (pending) return pending;
+    return id;
+  }
+
+  // ── Mutations ───────────────────────────────────────────────────────────
+
+  function addOrUpdateItem(partial: Partial<InventoryItem> & { name: string }): InventoryItem {
+    const now = new Date().toISOString();
+    const currentInventory = (inventoryQuery.data ?? []).map(toInventoryItem);
+    const existing =
+      (partial.id && currentInventory.find((i) => i.id === partial.id)) ||
+      (partial.barcode ? currentInventory.find((i) => i.barcode && i.barcode === partial.barcode) : undefined);
+
+    if (existing) {
+      const updated: InventoryItem = { ...existing, ...partial, updatedAt: now };
+
+      // Optimistic update
+      queryClient.setQueryData<ApiInventoryItem[]>(["/api/inventory"], (old) =>
+        (old ?? []).map((i) => (i.id === existing.id ? { ...i, ...toOptimisticApiItem(updated) } : i)),
+      );
+
+      // Fire API
+      apiRequest("PATCH", `/api/inventory/${existing.id}`, toApiInventoryBody(partial))
+        .then(() => queryClient.invalidateQueries({ queryKey: ["/api/inventory"] }));
+
+      return updated;
     }
 
-    function adjustItemQuantity(itemId: string, delta: number) {
-      setState((prev) => {
-        const inventory = prev.inventory.map((item) => {
-          if (item.id !== itemId) return item;
-          const quantity = Math.max(0, item.quantity + delta);
-          return { ...item, quantity, updatedAt: new Date().toISOString() };
-        });
-        return { ...prev, inventory };
-      });
-    }
+    // Create new item
+    const tempId = partial.id ?? uuid();
+    const item: InventoryItem = {
+      id: tempId,
+      name: partial.name,
+      brand: partial.brand,
+      category: partial.category ?? "Uncategorized",
+      barcode: partial.barcode?.trim() || undefined,
+      quantity: partial.quantity ?? 0,
 
-    function upsertClient(partial: Partial<ClientRecord> & { name: string; identifier: string }): ClientRecord {
-      const now = new Date().toISOString();
-      let existing =
-        (partial.id && state.clients.find((c) => c.id === partial.id)) ||
-        state.clients.find((c) => c.identifier === partial.identifier);
+      packageType: partial.packageType ?? "single",
+      unitCount: partial.unitCount ?? 1,
 
-      if (existing) {
-        const updated: ClientRecord = {
-          ...existing,
-          ...partial,
-          updatedAt: now,
-        };
-        setState((prev) => ({
-          ...prev,
-          clients: prev.clients.map((c) => (c.id === existing!.id ? updated : c)),
-        }));
-        return updated;
-      }
+      weightPerUnitLbs: partial.weightPerUnitLbs ?? 0,
+      netWeightG: partial.netWeightG,
+      unitWeightG: partial.unitWeightG,
+      weightIsEstimated: partial.weightIsEstimated,
 
-      const client: ClientRecord = {
-        id: partial.id ?? uuid(),
-        name: partial.name,
-        identifier: partial.identifier,
-        contact: partial.contact,
-        allergies: partial.allergies,
-        notes: partial.notes,
-        createdAt: now,
-        updatedAt: now,
-      };
-      setState((prev) => ({ ...prev, clients: [...prev.clients, client] }));
-      return client;
-    }
+      valuePerUnitUsd: partial.valuePerUnitUsd ?? 0,
+      costCents: partial.costCents,
+      costIsEstimated: partial.costIsEstimated,
+      currency: partial.currency ?? "USD",
 
-    function recordInbound(options: {
-      itemId: string;
-      quantity: number;
-      source?: string;
-      donor?: string;
-      timestamp?: string;
-      location?: GeoLocation;
-    }) {
-      const { itemId, quantity, source, donor, location } = options;
-      const timestamp = options.timestamp ?? new Date().toISOString();
+      reorderThreshold: partial.reorderThreshold,
+      allergens: partial.allergens,
 
-      if (!quantity || quantity <= 0) return;
+      winningSource: partial.winningSource,
+      matchConfidence: partial.matchConfidence,
 
-      setState((prev) => {
-        const item = prev.inventory.find((i) => i.id === itemId);
-        if (!item) return prev;
-
-        const inventory = prev.inventory.map((i) =>
-          i.id === itemId
-            ? { ...i, quantity: i.quantity + quantity, updatedAt: timestamp }
-            : i,
-        );
-
-        const tx: Transaction = {
-          id: uuid(),
-          type: "IN",
-          timestamp,
-          items: [
-            {
-              itemId: item.id,
-              name: item.name,
-              quantity,
-              weightPerUnitLbs: item.weightPerUnitLbs,
-              valuePerUnitUsd: item.valuePerUnitUsd,
-            },
-          ],
-          source,
-          donor,
-          location,
-        };
-
-        return {
-          ...prev,
-          inventory,
-          transactions: [tx, ...prev.transactions],
-        };
-      });
-    }
-
-    function recordOutbound(options: {
-      client: { id?: string; name: string; identifier: string; contact?: string };
-      items: { itemId: string; quantity: number }[];
-      timestamp?: string;
-      location?: GeoLocation;
-    }): { client: ClientRecord } | undefined {
-      const timestamp = options.timestamp ?? new Date().toISOString();
-
-      if (!options.items.length) return undefined;
-
-      let createdClient: ClientRecord | undefined;
-
-      setState((prev) => {
-        const client = upsertClient({
-          id: options.client.id,
-          name: options.client.name,
-          identifier: options.client.identifier,
-          contact: options.client.contact,
-        });
-        createdClient = client;
-
-        const inventory = prev.inventory.map((item) => {
-          const cartItem = options.items.find((i) => i.itemId === item.id);
-          if (!cartItem) return item;
-          const newQty = Math.max(0, item.quantity - cartItem.quantity);
-          return { ...item, quantity: newQty, updatedAt: timestamp };
-        });
-
-        const txItems: TransactionItem[] = options.items
-          .map((i) => {
-            const base = prev.inventory.find((item) => item.id === i.itemId);
-            if (!base) return undefined;
-            return {
-              itemId: base.id,
-              name: base.name,
-              quantity: i.quantity,
-              weightPerUnitLbs: base.weightPerUnitLbs,
-              valuePerUnitUsd: base.valuePerUnitUsd,
-            };
-          })
-          .filter(Boolean) as TransactionItem[];
-
-        if (!txItems.length) return prev;
-
-        const tx: Transaction = {
-          id: uuid(),
-          type: "OUT",
-          timestamp,
-          clientId: client.id,
-          clientName: client.name,
-          items: txItems,
-          location: options.location,
-        };
-
-        return {
-          ...prev,
-          inventory,
-          clients: prev.clients.some((c) => c.id === client.id)
-            ? prev.clients.map((c) => (c.id === client.id ? client : c))
-            : [client, ...prev.clients],
-          transactions: [tx, ...prev.transactions],
-        };
-      });
-
-      return createdClient ? { client: createdClient } : undefined;
-    }
-
-    function updateSettings(partial: Partial<Settings>) {
-      setState((prev) => ({ ...prev, settings: { ...prev.settings, ...partial } }));
-    }
-
-    function upsertBarcodeCache(barcode: string, entry: Omit<BarcodeCacheEntry, "cachedAt">) {
-      const cachedAt = new Date().toISOString();
-      setState((prev) => ({
-        ...prev,
-        barcodeCache: {
-          ...prev.barcodeCache,
-          [barcode]: { ...entry, cachedAt },
-        },
-      }));
-    }
-
-    function addSource(source: string) {
-      setState((prev) => {
-        if (prev.sources?.includes(source)) return prev;
-        return { ...prev, sources: [...(prev.sources || []), source] };
-      });
-    }
-
-    function addDonor(donor: string) {
-      setState((prev) => {
-        if (prev.donors?.includes(donor)) return prev;
-        return { ...prev, donors: [...(prev.donors || []), donor] };
-      });
-    }
-
-    return {
-      ...state,
-      addOrUpdateItem,
-      adjustItemQuantity,
-      recordInbound,
-      recordOutbound,
-      upsertClient,
-      updateSettings,
-      upsertBarcodeCache,
-      addSource,
-      addDonor,
+      createdAt: now,
+      updatedAt: now,
     };
-  }, [state]);
+
+    // Optimistic update
+    queryClient.setQueryData<ApiInventoryItem[]>(["/api/inventory"], (old) => [
+      ...(old ?? []),
+      toOptimisticApiItem(item),
+    ]);
+
+    // Track pending create
+    const createPromise = apiRequest("POST", "/api/inventory", toApiInventoryBody(item))
+      .then(async (res) => {
+        const created: ApiInventoryItem = await res.json();
+        // Replace temp ID in cache with real data
+        queryClient.setQueryData<ApiInventoryItem[]>(["/api/inventory"], (old) =>
+          (old ?? []).map((i) => (i.id === tempId ? created : i)),
+        );
+        pendingCreates.current.delete(tempId);
+        return created.id;
+      })
+      .catch(() => {
+        queryClient.invalidateQueries({ queryKey: ["/api/inventory"] });
+        pendingCreates.current.delete(tempId);
+        return tempId;
+      });
+
+    pendingCreates.current.set(tempId, createPromise);
+
+    return item;
+  }
+
+  function adjustItemQuantity(itemId: string, delta: number) {
+    // Optimistic update
+    queryClient.setQueryData<ApiInventoryItem[]>(["/api/inventory"], (old) =>
+      (old ?? []).map((i) => {
+        if (i.id !== itemId) return i;
+        return { ...i, quantity: Math.max(0, i.quantity + delta), updatedAt: new Date().toISOString() };
+      }),
+    );
+
+    // Fire API: read current quantity from cache to compute new value
+    const current = (inventoryQuery.data ?? []).find((i) => i.id === itemId);
+    if (current) {
+      const newQty = Math.max(0, current.quantity + delta);
+      apiRequest("PATCH", `/api/inventory/${itemId}`, { quantity: newQty })
+        .then(() => queryClient.invalidateQueries({ queryKey: ["/api/inventory"] }));
+    }
+  }
+
+  function upsertClient(partial: Partial<ClientRecord> & { name: string; identifier: string }): ClientRecord {
+    const now = new Date().toISOString();
+    const currentClients = (clientsQuery.data ?? []).map(toClientRecord);
+
+    // Only match by explicit ID — never merge different clients by identifier
+    const existing = partial.id
+      ? currentClients.find((c) => c.id === partial.id)
+      : undefined;
+
+    if (existing) {
+      const updated: ClientRecord = { ...existing, ...partial, updatedAt: now };
+
+      queryClient.setQueryData<ApiClient[]>(["/api/clients"], (old) =>
+        (old ?? []).map((c) => (c.id === existing.id ? toOptimisticApiClient(updated) : c)),
+      );
+
+      apiRequest("PATCH", `/api/clients/${existing.id}`, toApiClientBody(partial))
+        .then(() => queryClient.invalidateQueries({ queryKey: ["/api/clients"] }));
+
+      return updated;
+    }
+
+    const tempId = uuid();
+    const client: ClientRecord = {
+      id: tempId,
+      name: partial.name,
+      identifier: partial.identifier,
+      contact: partial.contact,
+      phone: partial.phone,
+      email: partial.email,
+      address: partial.address,
+      dateOfBirth: partial.dateOfBirth,
+      householdSize: partial.householdSize ?? 1,
+      eligibleDate: partial.eligibleDate,
+      certificationDate: partial.certificationDate,
+      status: partial.status ?? "active",
+      allergies: partial.allergies,
+      notes: partial.notes,
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    queryClient.setQueryData<ApiClient[]>(["/api/clients"], (old) => [
+      ...(old ?? []),
+      toOptimisticApiClient(client),
+    ]);
+
+    // Track pending client create so recordOutbound can await the real ID
+    const createPromise = apiRequest("POST", "/api/clients", toApiClientBody(client))
+      .then(async (res) => {
+        if (!res.ok) {
+          // Server rejected (e.g. duplicate identifier) — revert optimistic add
+          queryClient.invalidateQueries({ queryKey: ["/api/clients"] });
+          pendingClientCreates.current.delete(tempId);
+          return tempId;
+        }
+        const created: ApiClient = await res.json();
+        queryClient.setQueryData<ApiClient[]>(["/api/clients"], (old) =>
+          (old ?? []).map((c) => (c.id === tempId ? created : c)),
+        );
+        pendingClientCreates.current.delete(tempId);
+        return created.id;
+      })
+      .catch(() => {
+        queryClient.invalidateQueries({ queryKey: ["/api/clients"] });
+        pendingClientCreates.current.delete(tempId);
+        return tempId;
+      });
+
+    pendingClientCreates.current.set(tempId, createPromise);
+
+    return client;
+  }
+
+  function recordInbound(options: {
+    itemId: string;
+    quantity: number;
+    source?: string;
+    donor?: string;
+    timestamp?: string;
+    location?: GeoLocation;
+  }) {
+    const { itemId, quantity, source, donor, location } = options;
+    const timestamp = options.timestamp ?? new Date().toISOString();
+
+    if (!quantity || quantity <= 0) return;
+
+    const currentInventory = (inventoryQuery.data ?? []).map(toInventoryItem);
+    const item = currentInventory.find((i) => i.id === itemId);
+    if (!item) return;
+
+    // Optimistic inventory update
+    queryClient.setQueryData<ApiInventoryItem[]>(["/api/inventory"], (old) =>
+      (old ?? []).map((i) =>
+        i.id === itemId ? { ...i, quantity: i.quantity + quantity, updatedAt: timestamp } : i,
+      ),
+    );
+
+    // Optimistic transaction
+    const tempTxId = uuid();
+    const txItem: TransactionItem = {
+      itemId: item.id,
+      name: item.name,
+      quantity,
+      weightPerUnitLbs: item.weightPerUnitLbs,
+      valuePerUnitUsd: item.valuePerUnitUsd,
+    };
+
+    const optimisticTx: ApiTransaction = {
+      id: tempTxId,
+      type: "IN",
+      timestamp,
+      source: source ?? null,
+      donor: donor ?? null,
+      clientId: null,
+      clientName: null,
+      latitude: location?.latitude ?? null,
+      longitude: location?.longitude ?? null,
+      accuracy: location?.accuracy ?? null,
+      createdAt: timestamp,
+      items: [{
+        id: tempTxId,
+        transactionId: tempTxId,
+        inventoryItemId: item.id,
+        name: item.name,
+        quantity,
+        weightPerUnitLbs: String(item.weightPerUnitLbs),
+        valuePerUnitUsd: String(item.valuePerUnitUsd),
+      }],
+    };
+
+    queryClient.setQueryData<ApiTransaction[]>(["/api/transactions"], (old) => [
+      optimisticTx,
+      ...(old ?? []),
+    ]);
+
+    // Fire API
+    (async () => {
+      const realItemId = await resolveItemId(itemId);
+
+      // Update inventory on server
+      const currentItem = (queryClient.getQueryData<ApiInventoryItem[]>(["/api/inventory"]) ?? [])
+        .find((i) => i.id === realItemId);
+      if (currentItem) {
+        await apiRequest("PATCH", `/api/inventory/${realItemId}`, {
+          quantity: currentItem.quantity,
+        });
+      }
+
+      // Create transaction
+      await apiRequest("POST", "/api/transactions", {
+        type: "IN",
+        timestamp,
+        source: source ?? null,
+        donor: donor ?? null,
+        latitude: location?.latitude ?? null,
+        longitude: location?.longitude ?? null,
+        accuracy: location?.accuracy ?? null,
+        items: [{
+          inventoryItemId: realItemId,
+          name: txItem.name,
+          quantity: txItem.quantity,
+          weightPerUnitLbs: String(txItem.weightPerUnitLbs),
+          valuePerUnitUsd: String(txItem.valuePerUnitUsd),
+        }],
+      });
+
+      queryClient.invalidateQueries({ queryKey: ["/api/inventory"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/transactions"] });
+    })();
+  }
+
+  function recordOutbound(options: {
+    client: { id?: string; name: string; identifier: string; contact?: string };
+    items: { itemId: string; quantity: number }[];
+    timestamp?: string;
+    location?: GeoLocation;
+  }): { client: ClientRecord } | undefined {
+    const timestamp = options.timestamp ?? new Date().toISOString();
+    if (!options.items.length) return undefined;
+
+    const client = upsertClient({
+      id: options.client.id,
+      name: options.client.name,
+      identifier: options.client.identifier,
+      contact: options.client.contact,
+    });
+
+    const currentInventory = (inventoryQuery.data ?? []).map(toInventoryItem);
+
+    // Optimistic inventory update — auto-adjust if insufficient, never block
+    queryClient.setQueryData<ApiInventoryItem[]>(["/api/inventory"], (old) =>
+      (old ?? []).map((apiItem) => {
+        const cartItem = options.items.find((i) => i.itemId === apiItem.id);
+        if (!cartItem) return apiItem;
+        // If stock is insufficient, the net result is 0 (auto-adjusted)
+        const newQty = Math.max(0, apiItem.quantity - cartItem.quantity);
+        return { ...apiItem, quantity: newQty, updatedAt: timestamp };
+      }),
+    );
+
+    // Build transaction items
+    const txItems: TransactionItem[] = options.items
+      .map((i) => {
+        const base = currentInventory.find((item) => item.id === i.itemId);
+        if (!base) return undefined;
+        return {
+          itemId: base.id,
+          name: base.name,
+          quantity: i.quantity,
+          weightPerUnitLbs: base.weightPerUnitLbs,
+          valuePerUnitUsd: base.valuePerUnitUsd,
+        };
+      })
+      .filter(Boolean) as TransactionItem[];
+
+    if (!txItems.length) return { client };
+
+    // Optimistic transaction
+    const tempTxId = uuid();
+    const optimisticTx: ApiTransaction = {
+      id: tempTxId,
+      type: "OUT",
+      timestamp,
+      source: null,
+      donor: null,
+      clientId: client.id,
+      clientName: client.name,
+      latitude: options.location?.latitude ?? null,
+      longitude: options.location?.longitude ?? null,
+      accuracy: options.location?.accuracy ?? null,
+      createdAt: timestamp,
+      items: txItems.map((ti) => ({
+        id: tempTxId,
+        transactionId: tempTxId,
+        inventoryItemId: ti.itemId,
+        name: ti.name,
+        quantity: ti.quantity,
+        weightPerUnitLbs: String(ti.weightPerUnitLbs),
+        valuePerUnitUsd: String(ti.valuePerUnitUsd),
+      })),
+    };
+
+    queryClient.setQueryData<ApiTransaction[]>(["/api/transactions"], (old) => [
+      optimisticTx,
+      ...(old ?? []),
+    ]);
+
+    // Fire API
+    (async () => {
+      // CRITICAL: Resolve the real client ID before posting the transaction.
+      // If this is a new client, the server POST may still be in-flight.
+      // We must await it so the transaction links to the correct server client ID.
+      const realClientId = await resolveClientId(client.id);
+
+      // Patch each inventory item on server — auto-adjust if insufficient
+      for (const cartItem of options.items) {
+        const realId = await resolveItemId(cartItem.itemId);
+        const current = (queryClient.getQueryData<ApiInventoryItem[]>(["/api/inventory"]) ?? [])
+          .find((i) => i.id === realId);
+        if (current) {
+          // Server-side: ensure quantity covers checkout, then subtract
+          const serverQty = Math.max(0, current.quantity);
+          await apiRequest("PATCH", `/api/inventory/${realId}`, {
+            quantity: serverQty,
+          });
+        }
+      }
+
+      // Resolve item IDs for transaction items
+      const apiItems = await Promise.all(
+        txItems.map(async (ti) => {
+          const realId = await resolveItemId(ti.itemId);
+          return {
+            inventoryItemId: realId,
+            name: ti.name,
+            quantity: ti.quantity,
+            weightPerUnitLbs: String(ti.weightPerUnitLbs),
+            valuePerUnitUsd: String(ti.valuePerUnitUsd),
+          };
+        }),
+      );
+
+      await apiRequest("POST", "/api/transactions", {
+        type: "OUT",
+        timestamp,
+        clientId: realClientId,
+        clientName: client.name,
+        latitude: options.location?.latitude ?? null,
+        longitude: options.location?.longitude ?? null,
+        accuracy: options.location?.accuracy ?? null,
+        items: apiItems,
+      });
+
+      queryClient.invalidateQueries({ queryKey: ["/api/inventory"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/transactions"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/clients"] });
+    })();
+
+    return { client };
+  }
+
+  function updateSettings(partial: Partial<Settings>) {
+    setLocal((prev) => ({ ...prev, settings: { ...prev.settings, ...partial } }));
+  }
+
+  function upsertBarcodeCache(barcode: string, entry: Omit<BarcodeCacheEntry, "cachedAt">) {
+    const cachedAt = new Date().toISOString();
+    setLocal((prev) => ({
+      ...prev,
+      barcodeCache: { ...prev.barcodeCache, [barcode]: { ...entry, cachedAt } },
+    }));
+  }
+
+  function addSource(source: string) {
+    setLocal((prev) => {
+      if (prev.sources?.includes(source)) return prev;
+      return { ...prev, sources: [...(prev.sources || []), source] };
+    });
+  }
+
+  function addDonor(donor: string) {
+    setLocal((prev) => {
+      if (prev.donors?.includes(donor)) return prev;
+      return { ...prev, donors: [...(prev.donors || []), donor] };
+    });
+  }
+
+  function addCategory(category: string) {
+    setLocal((prev) => {
+      if (prev.categories?.includes(category)) return prev;
+      return { ...prev, categories: [...(prev.categories || []), category] };
+    });
+  }
+
+  // ── Loading & error gates ───────────────────────────────────────────────
+  const isLoading = inventoryQuery.isLoading || clientsQuery.isLoading || transactionsQuery.isLoading;
+  const error = inventoryQuery.error || clientsQuery.error || transactionsQuery.error;
+
+  if (isLoading) {
+    return (
+      <div className="flex items-center justify-center min-h-screen">
+        <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary" />
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="flex flex-col items-center justify-center min-h-screen gap-4">
+        <p className="text-destructive">Failed to load data: {(error as Error).message}</p>
+        <button
+          className="px-4 py-2 bg-primary text-primary-foreground rounded-md"
+          onClick={() => {
+            queryClient.invalidateQueries({ queryKey: ["/api/inventory"] });
+            queryClient.invalidateQueries({ queryKey: ["/api/clients"] });
+            queryClient.invalidateQueries({ queryKey: ["/api/transactions"] });
+          }}
+        >
+          Retry
+        </button>
+      </div>
+    );
+  }
+
+  const value: RepositoryContextValue = {
+    inventory,
+    clients,
+    transactions,
+    settings: local.settings,
+    barcodeCache: local.barcodeCache,
+    sources: local.sources,
+    donors: local.donors,
+    categories: local.categories,
+    addOrUpdateItem,
+    adjustItemQuantity,
+    recordInbound,
+    recordOutbound,
+    upsertClient,
+    updateSettings,
+    upsertBarcodeCache,
+    addSource,
+    addDonor,
+    addCategory,
+  };
 
   return <RepositoryContext.Provider value={value}>{children}</RepositoryContext.Provider>;
 }
@@ -439,4 +801,149 @@ export async function getCurrentLocation(): Promise<GeoLocation | undefined> {
   } catch {
     return undefined;
   }
+}
+
+// ─── Auto-Categorization ─────────────────────────────────────────────────────
+
+const CATEGORY_KEYWORDS: Record<string, string[]> = {
+  "Dairy & Eggs": ["milk", "cheese", "yogurt", "butter", "cream"],
+  "Bread & Bakery": ["bread", "roll", "bun", "bagel", "muffin"],
+  "Canned Goods": ["can", "canned", "soup", "beans", "tuna"],
+  "Grains & Pasta": ["rice", "pasta", "noodle", "flour", "oat"],
+  "Meat & Poultry": ["chicken", "beef", "pork", "turkey", "sausage", "meat"],
+  "Produce": ["apple", "banana", "orange", "lettuce", "tomato", "vegetable", "fruit"],
+  "Beverages": ["juice", "water", "soda", "tea", "coffee"],
+  "Snacks": ["chip", "cracker", "cookie", "candy", "snack", "bar"],
+  "Cereals & Breakfast": ["cereal", "oatmeal", "granola", "pancake"],
+  "Condiments & Sauces": ["ketchup", "mustard", "sauce", "dressing", "mayo"],
+  "Frozen Foods": ["frozen", "pizza", "ice cream"],
+  "Personal Care": ["diaper", "soap", "shampoo", "toothpaste"],
+  "Baby Food": ["baby", "formula", "infant"],
+};
+
+const LEARNED_ASSOCIATIONS_KEY = "morgan-learned-categories:v1";
+
+function loadLearnedAssociations(): Record<string, string> {
+  try {
+    const raw = window.localStorage.getItem(LEARNED_ASSOCIATIONS_KEY);
+    return raw ? JSON.parse(raw) : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveLearnedAssociation(keyword: string, category: string) {
+  try {
+    const current = loadLearnedAssociations();
+    current[keyword.toLowerCase()] = category;
+    window.localStorage.setItem(LEARNED_ASSOCIATIONS_KEY, JSON.stringify(current));
+  } catch {
+    // ignore
+  }
+}
+
+export function learnCategoryAssociation(itemName: string, category: string) {
+  const words = itemName.toLowerCase().split(/\s+/);
+  for (const word of words) {
+    if (word.length >= 3) {
+      saveLearnedAssociation(word, category);
+    }
+  }
+}
+
+export function suggestCategory(itemName: string): { category: string; confidence: number } {
+  if (!itemName.trim()) {
+    return { category: "Uncategorized", confidence: 0 };
+  }
+
+  const nameLower = itemName.toLowerCase();
+  const words = nameLower.split(/\s+/);
+
+  // Check learned associations first (highest priority)
+  const learned = loadLearnedAssociations();
+  for (const word of words) {
+    if (learned[word]) {
+      return { category: learned[word], confidence: 0.85 };
+    }
+  }
+
+  // Check built-in keyword map
+  for (const [category, keywords] of Object.entries(CATEGORY_KEYWORDS)) {
+    for (const keyword of keywords) {
+      // Exact word match in item name
+      if (words.some((w) => w === keyword || w === keyword + "s" || w === keyword + "es")) {
+        return { category, confidence: 0.9 };
+      }
+    }
+  }
+
+  // Partial match (keyword appears as substring)
+  for (const [category, keywords] of Object.entries(CATEGORY_KEYWORDS)) {
+    for (const keyword of keywords) {
+      if (nameLower.includes(keyword)) {
+        return { category, confidence: 0.7 };
+      }
+    }
+  }
+
+  return { category: "Uncategorized", confidence: 0 };
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function toOptimisticApiItem(item: InventoryItem): ApiInventoryItem {
+  return {
+    id: item.id,
+    name: item.name,
+    brand: item.brand ?? null,
+    category: item.category,
+    barcode: item.barcode ?? null,
+    quantity: item.quantity,
+
+    packageType: item.packageType ?? "single",
+    unitCount: item.unitCount ?? 1,
+
+    weightPerUnitLbs: String(item.weightPerUnitLbs),
+    netWeightG: item.netWeightG ?? null,
+    unitWeightG: item.unitWeightG ?? null,
+    weightIsEstimated: item.weightIsEstimated ?? false,
+
+    valuePerUnitUsd: String(item.valuePerUnitUsd),
+    costCents: item.costCents ?? null,
+    costIsEstimated: item.costIsEstimated ?? false,
+    currency: item.currency ?? "USD",
+
+    reorderThreshold: item.reorderThreshold ?? null,
+    allergens: item.allergens ?? [],
+    expirationDate: null,
+
+    dataSourcesTried: null,
+    winningSource: item.winningSource ?? null,
+    matchConfidence: item.matchConfidence ?? null,
+    rawPayload: null,
+
+    createdAt: item.createdAt,
+    updatedAt: item.updatedAt,
+  };
+}
+
+function toOptimisticApiClient(client: ClientRecord): ApiClient {
+  return {
+    id: client.id,
+    name: client.name,
+    identifier: client.identifier,
+    contact: client.contact ?? null,
+    phone: client.phone ?? null,
+    email: client.email ?? null,
+    address: client.address ?? null,
+    dateOfBirth: client.dateOfBirth ?? null,
+    householdSize: client.householdSize ?? 1,
+    eligibleDate: client.eligibleDate ?? null,
+    certificationDate: client.certificationDate ?? null,
+    status: client.status ?? "active",
+    allergies: client.allergies ?? [],
+    notes: client.notes ?? null,
+    createdAt: client.createdAt,
+    updatedAt: client.updatedAt,
+  };
 }

@@ -1,5 +1,9 @@
 import React, { useMemo, useState, useRef } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useRepository, getCurrentLocation } from "@/lib/repository";
+import { lookupBarcode } from "@/lib/barcode-lookup";
+import { toInventoryItem, type ApiInventoryItem } from "@/lib/api-types";
+import { apiRequest } from "@/lib/queryClient";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
@@ -7,11 +11,36 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogDescription } from "@/components/ui/dialog";
 import { useToast } from "@/hooks/use-toast";
-import { ShoppingCartIcon, AlertTriangleIcon } from "lucide-react";
+import { ShoppingCartIcon, AlertTriangleIcon, Loader2, PlusCircle, XIcon, LayersIcon, PrinterIcon, PackageIcon } from "lucide-react";
+
+type ItemGroupItem = {
+  id: string;
+  groupId: string;
+  inventoryItemId: string;
+  name: string;
+  defaultQuantity: number;
+};
+
+type ItemGroup = {
+  id: string;
+  name: string;
+  description: string | null;
+  items: ItemGroupItem[];
+  createdAt: string;
+  updatedAt: string;
+};
+
+type ReceiptData = {
+  clientName: string;
+  clientIdentifier: string;
+  items: { name: string; quantity: number }[];
+  timestamp: string;
+};
 
 export default function CheckOutPage() {
-  const { inventory, clients, recordOutbound, barcodeCache, upsertBarcodeCache, addOrUpdateItem } =
+  const { inventory, clients, recordOutbound, upsertBarcodeCache, addOrUpdateItem, categories } =
     useRepository();
+  const queryClient = useQueryClient();
   const { toast } = useToast();
 
   const [clientId, setClientId] = useState<string | "new" | "">("");
@@ -22,7 +51,32 @@ export default function CheckOutPage() {
 
   const [cart, setCart] = useState<{ itemId: string; quantity: number }[]>([]);
   const [barcode, setBarcode] = useState("");
+  const [scanLoading, setScanLoading] = useState(false);
   const barcodeInputRef = useRef<HTMLInputElement>(null);
+
+  // Manual item entry form (shown when barcode not found or user clicks "New item")
+  const [newItemForm, setNewItemForm] = useState<{
+    barcode: string;
+    name: string;
+    category: string;
+    weightPerUnitLbs: number;
+    valuePerUnitUsd: number;
+  } | null>(null);
+
+  // Item groups for quick-pick bundles
+  const { data: itemGroups = [] } = useQuery<ItemGroup[]>({
+    queryKey: ["/api/item-groups"],
+    queryFn: async () => {
+      const res = await apiRequest("GET", "/api/item-groups");
+      return res.json();
+    },
+  });
+
+  // Receipt state for post-checkout print
+  const [receipt, setReceipt] = useState<ReceiptData | null>(null);
+
+  // Track which approved request is being fulfilled through checkout
+  const [fulfillingRequestId, setFulfillingRequestId] = useState<string | null>(null);
 
   // Allergy warning state
   const [allergyWarning, setAllergyWarning] = useState<{
@@ -68,12 +122,11 @@ export default function CheckOutPage() {
     if (clientId && clientId !== "new") {
         const item = inventory.find(i => i.id === itemId);
         if (item && item.allergens && item.allergens.length > 0 && clientAllergies.length > 0) {
-            const matches = item.allergens.filter(a => 
+            const matches = item.allergens.filter(a =>
                 clientAllergies.some(ca => ca.toLowerCase().includes(a.toLowerCase()) || a.toLowerCase().includes(ca.toLowerCase()))
             );
-            
+
             if (matches.length > 0) {
-                // Show warning
                 setAllergyWarning({
                     isOpen: true,
                     itemName: item.name,
@@ -82,7 +135,6 @@ export default function CheckOutPage() {
                     onConfirm: () => {
                         performAddToCart(itemId, quantity);
                         setAllergyWarning(null);
-                        // Refocus input after confirming
                         setTimeout(() => barcodeInputRef.current?.focus(), 100);
                     }
                 });
@@ -92,6 +144,23 @@ export default function CheckOutPage() {
     }
 
     performAddToCart(itemId, quantity);
+  }
+
+  function addBundleToCart(group: ItemGroup) {
+    let addedCount = 0;
+    for (const groupItem of group.items) {
+      const invItem = inventory.find((i) => i.id === groupItem.inventoryItemId);
+      if (invItem) {
+        performAddToCart(invItem.id, groupItem.defaultQuantity);
+        addedCount++;
+      }
+    }
+    if (addedCount > 0) {
+      toast({
+        title: "Bundle added",
+        description: `${group.name}: ${addedCount} item${addedCount === 1 ? "" : "s"} added to cart.`,
+      });
+    }
   }
 
   function performAddToCart(itemId: string, quantity: number) {
@@ -110,78 +179,101 @@ export default function CheckOutPage() {
     const trimmed = code.trim();
     if (!trimmed) return;
 
-    // 1. Global Lookup First (per requirements)
+    setScanLoading(true);
+
     try {
-      const res = await fetch(`https://world.openfoodfacts.org/api/v0/product/${trimmed}.json`);
-      if (res.ok) {
-        const data = await res.json();
-        if (data.status === 1) {
-          const p = data.product;
-          const name = p.product_name || p.generic_name || "";
-          const category = (Array.isArray(p.categories_tags) && p.categories_tags[0]?.split(":").pop()) || "Uncategorized";
-          const grams = p.product_quantity && p.product_quantity_unit === "g" ? Number(p.product_quantity) : undefined;
-          const weight = grams && !isNaN(grams) ? grams / 453.592 : 0;
-          const allergens = (p.allergens_tags || []).map((a: string) => a.split(":").pop()?.replace(/-/g, " ") || a);
+      const result = await lookupBarcode(trimmed);
 
-          // Check if we already have this item locally to avoid duplicate creation?
-          // Requirement says "do not overwrite existing locally edited items unless the item is new"
-          // We should check if an item with this barcode exists.
-          const existing = inventory.find((i) => i.barcode === trimmed);
-          if (existing) {
-             // Found locally, add to cart
-             addToCart(existing.id, 1);
-             toast({ title: "Item added", description: `${existing.name} added via global scan.` });
-             return;
-          }
-
-          // Not found locally, create it from global data
-          upsertBarcodeCache(trimmed, { name, category, weightPerUnitLbs: weight, allergens });
-          const item = addOrUpdateItem({
-            name: name || "Unknown Item",
-            category: category,
-            barcode: trimmed,
-            quantity: 0, // Initial quantity 0 when discovered at checkout? Or should we prompt? usually 0.
-            weightPerUnitLbs: weight,
-            allergens: allergens,
-          });
-          addToCart(item.id, 1);
-          toast({ title: "New item found", description: `${item.name} added from global database.` });
-          return;
-        }
+      if (result.status === "debounced") {
+        setScanLoading(false);
+        return;
       }
-    } catch {
-      // Ignore network errors
-    }
 
-    // 2. Local Inventory Fallback
-    const existing = inventory.find((i) => i.barcode === trimmed);
-    if (existing) {
-      addToCart(existing.id, 1);
-      toast({ title: "Item added", description: `${existing.name} added via barcode.` });
-      return;
-    }
+      if (result.status === "exists") {
+        const item = toInventoryItem(result.item as ApiInventoryItem);
+        queryClient.invalidateQueries({ queryKey: ["/api/inventory"] });
+        addToCart(item.id, 1);
+        toast({ title: "Item added", description: `${item.name} added to cart.` });
+        setScanLoading(false);
+        setTimeout(() => barcodeInputRef.current?.focus(), 100);
+        return;
+      }
 
-    // 3. Local Cache Fallback
-    const cached = barcodeCache[trimmed];
-    if (cached && cached.name) {
-      const item = addOrUpdateItem({
-        name: cached.name,
-        category: cached.category ?? "Uncategorized",
+      if (result.status === "created") {
+        const item = toInventoryItem(result.item as ApiInventoryItem);
+        upsertBarcodeCache(trimmed, {
+          name: item.name,
+          category: item.category,
+          weightPerUnitLbs: item.weightPerUnitLbs,
+          allergens: item.allergens,
+        });
+        queryClient.invalidateQueries({ queryKey: ["/api/inventory"] });
+        addToCart(item.id, 1);
+        const srcLabel = result.product?.winningSource || "API";
+        toast({
+          title: "New item added",
+          description: `${item.name} found via ${srcLabel} and added to cart.`,
+        });
+        setScanLoading(false);
+        setTimeout(() => barcodeInputRef.current?.focus(), 100);
+        return;
+      }
+
+      // Not found in any database — show manual entry form so staff can fill in details
+      setNewItemForm({
         barcode: trimmed,
-        quantity: 0,
-        weightPerUnitLbs: cached.weightPerUnitLbs ?? 0,
-        allergens: cached.allergens,
+        name: "",
+        category: "Uncategorized",
+        weightPerUnitLbs: 0,
+        valuePerUnitUsd: 0,
       });
-      addToCart(item.id, 1);
-      toast({ title: "New item from cache", description: `${item.name} added via cached barcode.` });
+      setScanLoading(false);
+      toast({
+        title: "Item not recognized",
+        description: "Fill in the item details below to add it to the cart.",
+      });
+    } catch {
+      toast({
+        title: "Lookup failed",
+        description: "Could not reach product databases. Try again or add item manually.",
+      });
+      setScanLoading(false);
+    }
+  }
+
+  function handleAddNewItem() {
+    if (!newItemForm) return;
+    if (!newItemForm.name.trim()) {
+      toast({
+        title: "Item name required",
+        description: "Enter a name for the item before adding to cart.",
+      });
       return;
     }
-
-    // 4. Not found
-    toast({
-      title: "Barcode not found",
-      description: "Item not in global or local database. Please add it in Inventory.",
+    const created = addOrUpdateItem({
+      name: newItemForm.name.trim(),
+      category: newItemForm.category || "Uncategorized",
+      barcode: newItemForm.barcode.trim() || undefined,
+      quantity: 0,
+      weightPerUnitLbs: newItemForm.weightPerUnitLbs,
+      valuePerUnitUsd: newItemForm.valuePerUnitUsd,
     });
+    if (newItemForm.barcode.trim()) {
+      upsertBarcodeCache(newItemForm.barcode.trim(), {
+        name: newItemForm.name.trim(),
+        category: newItemForm.category || "Uncategorized",
+        weightPerUnitLbs: newItemForm.weightPerUnitLbs,
+        allergens: [],
+      });
+    }
+    queryClient.invalidateQueries({ queryKey: ["/api/inventory"] });
+    addToCart(created.id, 1);
+    setNewItemForm(null);
+    toast({
+      title: "Item added to cart",
+      description: `${newItemForm.name.trim()} saved and added to cart.`,
+    });
+    setTimeout(() => barcodeInputRef.current?.focus(), 100);
   }
 
   async function handleSubmit(e: React.FormEvent) {
@@ -204,18 +296,8 @@ export default function CheckOutPage() {
       return;
     }
 
-    // Validate stock
-    for (const line of cart) {
-      const item = inventory.find((i) => i.id === line.itemId);
-      if (!item) continue;
-      if (line.quantity > item.quantity) {
-        toast({
-          title: "Insufficient stock",
-          description: `Cannot check out ${line.quantity} of ${item.name}; only ${item.quantity} available.`,
-        });
-        return;
-      }
-    }
+    // No stock validation — checkout always proceeds.
+    // If inventory is insufficient, it will be auto-adjusted.
 
     const location = await getCurrentLocation();
 
@@ -231,10 +313,48 @@ export default function CheckOutPage() {
     });
 
     if (result?.client) {
-      toast({
-        title: "Check-out recorded",
-        description: `Distribution recorded for ${result.client.name}${location ? " with location" : ""}.`,
+      // Build receipt data before clearing the cart
+      const receiptItems = cart
+        .map((c) => {
+          const item = inventory.find((i) => i.id === c.itemId);
+          return item ? { name: item.brand ? `${item.brand} - ${item.name}` : item.name, quantity: c.quantity } : null;
+        })
+        .filter(Boolean) as { name: string; quantity: number }[];
+
+      setReceipt({
+        clientName: clientNameFinal,
+        clientIdentifier: identifierFinal,
+        items: receiptItems,
+        timestamp: new Date().toISOString(),
       });
+
+      // If this checkout fulfills an approved request, mark it completed
+      if (fulfillingRequestId) {
+        try {
+          await apiRequest("POST", `/api/requests/${fulfillingRequestId}/fulfill`);
+          queryClient.invalidateQueries({ queryKey: ["/api/requests"] });
+          toast({
+            title: "Request fulfilled",
+            description: `Check-out recorded and request marked as completed for ${result.client.name}.`,
+          });
+        } catch (e) {
+          if (import.meta.env.DEV) {
+            // eslint-disable-next-line no-console
+            console.error("Failed to mark request as fulfilled:", e);
+          }
+          toast({
+            title: "Check-out recorded",
+            description: "Distribution recorded but request status may not have updated. Check the Requests tab.",
+            variant: "destructive",
+          });
+        }
+        setFulfillingRequestId(null);
+      } else {
+        toast({
+          title: "Check-out recorded",
+          description: `Distribution recorded for ${result.client.name}${location ? " with location" : ""}.`,
+        });
+      }
       setCart([]);
       setClientFromId(result.client.id);
     }
@@ -311,6 +431,60 @@ export default function CheckOutPage() {
             </div>
 
             <div className="space-y-3">
+              {/* Approved Requests — load into cart */}
+              <ApprovedRequestsSection
+                onLoad={(req: any) => {
+                  // Auto-fill client
+                  const existingClient = clients.find((c: any) => c.identifier === req.clientIdentifier || c.id === req.clientId);
+                  if (existingClient) {
+                    setClientFromId(existingClient.id);
+                  } else {
+                    setClientId("new");
+                    setClientName(req.clientName || "");
+                    setClientIdentifier(req.clientIdentifier || "");
+                    setClientContact("");
+                  }
+                  // Auto-fill cart from approved items
+                  const newCart: { itemId: string; quantity: number }[] = [];
+                  for (const item of (req.items || [])) {
+                    if (item.approvedQuantity > 0 || item.approved_quantity > 0) {
+                      newCart.push({ itemId: item.inventoryItemId || item.inventory_item_id, quantity: item.approvedQuantity || item.approved_quantity });
+                    }
+                  }
+                  setCart(newCart);
+                  setFulfillingRequestId(req.id);
+                  toast({ title: "Request loaded", description: `${req.clientName || req.client_name}'s approved items loaded into cart. Will be marked fulfilled after checkout.` });
+                }}
+              />
+
+              {/* Quick-Pick Bundles */}
+              {itemGroups.length > 0 && (
+                <div className="space-y-1.5">
+                  <label className="text-sm font-medium flex items-center gap-1.5">
+                    <LayersIcon className="h-3.5 w-3.5 text-[hsl(22_92%_60%)]" />
+                    Quick-Pick Bundles
+                  </label>
+                  <div className="flex flex-wrap gap-1.5">
+                    {itemGroups.map((group) => (
+                      <Button
+                        key={group.id}
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        className="h-auto py-1.5 px-2.5 text-xs flex flex-col items-start gap-0.5"
+                        onClick={() => addBundleToCart(group)}
+                        data-testid={`button-bundle-${group.id}`}
+                      >
+                        <span className="font-medium">{group.name}</span>
+                        <span className="text-[10px] text-muted-foreground">
+                          {group.items.length} item{group.items.length === 1 ? "" : "s"}
+                        </span>
+                      </Button>
+                    ))}
+                  </div>
+                </div>
+              )}
+
               <div className="space-y-1.5">
                 <label className="text-sm font-medium" htmlFor="item-select" data-testid="label-add-item">
                   Add item to cart
@@ -323,12 +497,12 @@ export default function CheckOutPage() {
                     <SelectContent>
                       {sortedInventory.map((i) => (
                         <SelectItem key={i.id} value={i.id} data-testid={`option-cart-item-${i.id}`}>
-                          {i.name} • {i.quantity} on hand
+                          {i.brand ? `${i.brand} - ` : ""}{i.name} • {i.quantity} on hand
                         </SelectItem>
                       ))}
                     </SelectContent>
                   </Select>
-                  <div className="flex gap-2">
+                  <div className="flex gap-2 relative">
                     <Input
                       ref={barcodeInputRef}
                       type="text"
@@ -345,18 +519,117 @@ export default function CheckOutPage() {
                         }
                       }}
                       className="w-40"
+                      disabled={scanLoading}
                       autoFocus
                       data-testid="input-barcode"
                     />
+                    {scanLoading && (
+                      <Loader2 className="absolute right-2 top-2.5 h-4 w-4 animate-spin text-muted-foreground" />
+                    )}
                   </div>
                 </div>
-                <p className="text-[10px] text-muted-foreground">USB Scanner: Focus scan field and Enter.</p>
+                <p className="text-[10px] text-muted-foreground">
+                  {scanLoading
+                    ? "Looking up barcode..."
+                    : "USB Scanner: Focus scan field and Enter. Auto-lookup enabled."}
+                </p>
               </div>
+
+              {/* Manual new item button */}
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="w-full flex items-center gap-1.5 text-xs"
+                onClick={() => setNewItemForm({ barcode: "", name: "", category: "Uncategorized", weightPerUnitLbs: 0, valuePerUnitUsd: 0 })}
+              >
+                <PlusCircle className="h-3.5 w-3.5" />
+                New item not in system
+              </Button>
+
+              {/* Manual item entry form */}
+              {newItemForm && (
+                <div className="border border-dashed rounded-lg p-3 space-y-2 bg-muted/30">
+                  <div className="flex items-center justify-between">
+                    <p className="text-xs font-medium text-muted-foreground">Enter item details</p>
+                    <Button type="button" variant="ghost" size="icon" className="h-5 w-5" onClick={() => setNewItemForm(null)}>
+                      <XIcon className="h-3 w-3" />
+                    </Button>
+                  </div>
+                  <div className="grid gap-2 grid-cols-2">
+                    <div className="col-span-2 space-y-1">
+                      <label className="text-xs font-medium">Item name *</label>
+                      <Input
+                        value={newItemForm.name}
+                        onChange={(e) => setNewItemForm(p => p ? { ...p, name: e.target.value } : p)}
+                        placeholder="e.g. Canned Soup, Rice (5 lb bag)"
+                        className="h-8 text-sm"
+                        autoFocus
+                        onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); handleAddNewItem(); } }}
+                      />
+                    </div>
+                    <div className="space-y-1">
+                      <label className="text-xs font-medium">Category</label>
+                      <Select
+                        value={newItemForm.category}
+                        onValueChange={(val) => setNewItemForm(p => p ? { ...p, category: val } : p)}
+                      >
+                        <SelectTrigger className="h-8 text-xs">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {categories.map(cat => <SelectItem key={cat} value={cat}>{cat}</SelectItem>)}
+                        </SelectContent>
+                      </Select>
+                    </div>
+                    <div className="space-y-1">
+                      <label className="text-xs font-medium">Barcode (optional)</label>
+                      <Input
+                        value={newItemForm.barcode}
+                        onChange={(e) => setNewItemForm(p => p ? { ...p, barcode: e.target.value } : p)}
+                        placeholder="UPC / barcode"
+                        className="h-8 text-sm"
+                      />
+                    </div>
+                    <div className="space-y-1">
+                      <label className="text-xs font-medium">Weight/unit (lbs)</label>
+                      <Input
+                        type="number"
+                        min={0}
+                        step="0.01"
+                        value={newItemForm.weightPerUnitLbs}
+                        onChange={(e) => setNewItemForm(p => p ? { ...p, weightPerUnitLbs: Number(e.target.value) || 0 } : p)}
+                        className="h-8 text-sm"
+                      />
+                    </div>
+                    <div className="space-y-1">
+                      <label className="text-xs font-medium">Value/unit ($)</label>
+                      <Input
+                        type="number"
+                        min={0}
+                        step="0.01"
+                        value={newItemForm.valuePerUnitUsd}
+                        onChange={(e) => setNewItemForm(p => p ? { ...p, valuePerUnitUsd: Number(e.target.value) || 0 } : p)}
+                        className="h-8 text-sm"
+                      />
+                    </div>
+                  </div>
+                  <Button type="button" size="sm" className="w-full" onClick={handleAddNewItem}>
+                    Save item &amp; add to cart
+                  </Button>
+                </div>
+              )}
 
               <CartTable cart={cart} setCart={setCart} />
             </div>
           </section>
 
+          {fulfillingRequestId && (
+            <div className="text-xs text-green-700 bg-green-50 border border-green-200 rounded px-2 py-1.5 flex items-center gap-1.5">
+              <PackageIcon className="h-3.5 w-3.5" />
+              Fulfilling approved request. Status will update to Completed after checkout.
+            </div>
+          )}
           <div className="flex items-center justify-between pt-2">
             <p className="text-[11px] text-muted-foreground" data-testid="text-check-out-help">
               This will reduce inventory and log an OUT transaction linked to this client.
@@ -394,6 +667,62 @@ export default function CheckOutPage() {
               <Button variant="outline" onClick={() => setAllergyWarning(null)}>Cancel</Button>
               <Button variant="destructive" onClick={() => allergyWarning?.onConfirm()}>
                 Confirm & Add Anyway
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+
+        {/* Receipt Dialog */}
+        <Dialog open={!!receipt} onOpenChange={(open) => { if (!open) setReceipt(null); }}>
+          <DialogContent className="max-w-md">
+            <DialogHeader>
+              <DialogTitle className="flex items-center gap-2">
+                <PrinterIcon className="h-5 w-5" />
+                Distribution Receipt
+              </DialogTitle>
+              <DialogDescription>
+                Review and print the receipt for this distribution.
+              </DialogDescription>
+            </DialogHeader>
+            {receipt && <ReceiptContent receipt={receipt} />}
+            <DialogFooter className="gap-2">
+              <Button variant="outline" onClick={() => setReceipt(null)}>Close</Button>
+              <Button
+                onClick={() => {
+                  const printArea = document.getElementById("receipt-print-area");
+                  if (!printArea) return;
+                  const printWindow = window.open("", "_blank", "width=400,height=600");
+                  if (!printWindow) return;
+                  printWindow.document.write(`
+                    <!DOCTYPE html>
+                    <html><head><title>Receipt</title>
+                    <style>
+                      body { font-family: 'Segoe UI', Arial, sans-serif; padding: 20px; max-width: 380px; margin: 0 auto; color: #111; }
+                      h2 { text-align: center; margin: 0 0 2px; font-size: 16px; }
+                      .org-info { text-align: center; font-size: 11px; color: #555; margin-bottom: 12px; line-height: 1.5; }
+                      .divider { border-top: 1px dashed #999; margin: 10px 0; }
+                      .field { font-size: 12px; margin: 4px 0; }
+                      .field strong { display: inline-block; width: 60px; }
+                      table { width: 100%; border-collapse: collapse; margin: 8px 0; }
+                      th { text-align: left; font-size: 11px; border-bottom: 1px solid #333; padding: 4px 0; }
+                      th:last-child { text-align: right; }
+                      td { font-size: 12px; padding: 3px 0; }
+                      td:last-child { text-align: right; }
+                      .footer { text-align: center; font-size: 10px; color: #777; margin-top: 16px; }
+                    </style>
+                    </head><body>
+                    ${printArea.innerHTML}
+                    </body></html>
+                  `);
+                  printWindow.document.close();
+                  printWindow.focus();
+                  printWindow.print();
+                  printWindow.close();
+                }}
+                data-testid="button-print-receipt"
+              >
+                <PrinterIcon className="h-4 w-4 mr-1.5" />
+                Print Receipt
               </Button>
             </DialogFooter>
           </DialogContent>
@@ -460,10 +789,18 @@ function CartTable({
                   <TableCell>
                     <div className="flex flex-col gap-0.5">
                       <span className="text-sm font-medium" data-testid={`text-cart-item-name-${line.itemId}`}>
-                        {item.name}
+                        {item.brand ? `${item.brand} - ` : ""}{item.name}
                       </span>
                       <span className="text-[11px] text-muted-foreground" data-testid={`text-cart-item-category-${line.itemId}`}>
                         {item.category || "Uncategorized"}
+                        {item.packageType && item.packageType !== "single" && (
+                          <> • {item.packageType.replace(/_/g, " ")} ({item.unitCount})</>
+                        )}
+                        {item.netWeightG ? (
+                          <> • {item.netWeightG >= 1000 ? `${(item.netWeightG / 1000).toFixed(1)}kg` : `${Math.round(item.netWeightG)}g`}{item.weightIsEstimated ? " ~est" : ""}</>
+                        ) : item.weightPerUnitLbs > 0 ? (
+                          <> • {item.weightPerUnitLbs.toFixed(2)} lbs/unit</>
+                        ) : null}
                       </span>
                     </div>
                   </TableCell>
@@ -474,7 +811,6 @@ function CartTable({
                     <Input
                       type="number"
                       min={1}
-                      max={item.quantity}
                       value={line.quantity}
                       onChange={(e) => updateQuantity(line.itemId, Number(e.target.value) || 0)}
                       className="h-7 w-20 ml-auto text-right"
@@ -500,5 +836,140 @@ function CartTable({
         </Table>
       </CardContent>
     </Card>
+  );
+}
+
+function ReceiptContent({ receipt }: { receipt: ReceiptData }) {
+  const { data: orgSettings = {} } = useQuery<Record<string, string>>({
+    queryKey: ["/api/settings"],
+    queryFn: async () => {
+      const res = await apiRequest("GET", "/api/settings");
+      return res.json();
+    },
+  });
+
+  const orgName = orgSettings.orgName || "Morgan State University Food Resource Center";
+  const orgAddress = orgSettings.orgAddress || "";
+  const orgPhone = orgSettings.orgPhone || "";
+  const orgEmail = orgSettings.orgEmail || "";
+
+  const date = new Date(receipt.timestamp);
+  const formattedDate = date.toLocaleDateString("en-US", {
+    weekday: "long",
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+  });
+  const formattedTime = date.toLocaleTimeString("en-US", {
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+  const totalItems = receipt.items.reduce((sum, i) => sum + i.quantity, 0);
+
+  return (
+    <div id="receipt-print-area" className="space-y-3 py-2">
+      <div className="text-center space-y-0.5">
+        <h2 className="text-base font-bold">{orgName}</h2>
+        <div className="text-[11px] text-muted-foreground leading-relaxed">
+          {orgAddress && <p>{orgAddress}</p>}
+          {(orgPhone || orgEmail) && (
+            <p>{[orgPhone, orgEmail].filter(Boolean).join(" | ")}</p>
+          )}
+        </div>
+      </div>
+
+      <div className="border-t border-dashed" />
+
+      <div className="space-y-1 text-sm">
+        <div><strong>Client:</strong> {receipt.clientName}</div>
+        <div><strong>ID:</strong> {receipt.clientIdentifier}</div>
+        <div><strong>Date:</strong> {formattedDate}</div>
+        <div><strong>Time:</strong> {formattedTime}</div>
+      </div>
+
+      <div className="border-t border-dashed" />
+
+      <table className="w-full text-sm">
+        <thead>
+          <tr className="border-b">
+            <th className="text-left py-1 font-medium text-xs">Item</th>
+            <th className="text-right py-1 font-medium text-xs">Qty</th>
+          </tr>
+        </thead>
+        <tbody>
+          {receipt.items.map((item, idx) => (
+            <tr key={idx} className="border-b border-dashed last:border-0">
+              <td className="py-1">{item.name}</td>
+              <td className="text-right py-1">{item.quantity}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+
+      <div className="border-t border-dashed" />
+
+      <div className="flex justify-between text-sm font-medium">
+        <span>Total items</span>
+        <span>{totalItems}</span>
+      </div>
+
+      <div className="text-center text-[10px] text-muted-foreground pt-2">
+        <p>Thank you for visiting {orgName}.</p>
+        <p>This receipt is for record-keeping purposes only. No pricing applies.</p>
+      </div>
+    </div>
+  );
+}
+
+function ApprovedRequestsSection({ onLoad }: { onLoad: (req: any) => void }) {
+  const [expanded, setExpanded] = React.useState(false);
+  const { data: approvedRequests = [] } = useQuery<any[]>({
+    queryKey: ["/api/requests", "approved-for-checkout"],
+    queryFn: async () => {
+      const res = await apiRequest("GET", "/api/requests?status=approved");
+      const approved = await res.json();
+      const res2 = await apiRequest("GET", "/api/requests?status=partially_approved");
+      const partial = await res2.json();
+      const res3 = await apiRequest("GET", "/api/requests?status=ready_for_pickup");
+      const ready = await res3.json();
+      return [...approved, ...partial, ...ready];
+    },
+  });
+
+  if (approvedRequests.length === 0) return null;
+
+  return (
+    <div className="space-y-1.5">
+      <button
+        type="button"
+        className="text-sm font-medium flex items-center gap-1.5 text-green-700 hover:underline"
+        onClick={() => setExpanded(!expanded)}
+      >
+        <PackageIcon className="h-3.5 w-3.5" />
+        Approved Requests ({approvedRequests.length})
+        <span className="text-xs text-muted-foreground ml-1">{expanded ? "hide" : "show"}</span>
+      </button>
+      {expanded && (
+        <div className="space-y-1.5">
+          {approvedRequests.map((req: any) => (
+            <div key={req.id} className="flex items-center justify-between border rounded px-3 py-2 text-xs bg-green-50/50">
+              <div>
+                <span className="font-medium">{req.clientName || req.client_name}</span>
+                <span className="text-muted-foreground ml-2">
+                  {(req.items?.length ?? 0)} item(s)
+                </span>
+              </div>
+              <button
+                type="button"
+                className="text-xs font-medium text-green-700 hover:underline"
+                onClick={() => onLoad(req)}
+              >
+                Load into Cart
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
   );
 }

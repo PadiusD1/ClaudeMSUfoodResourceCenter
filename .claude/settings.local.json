@@ -1,0 +1,32 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dir:*)",
+      "Bash(node --version:*)",
+      "Bash(npm:*)",
+      "Bash(npx tsx:*)",
+      "Bash(netstat:*)",
+      "Bash(taskkill:*)",
+      "Bash(cmd /c:*)",
+      "Bash(npx tsc:*)",
+      "Bash(npx cross-env:*)",
+      "Bash(curl:*)",
+      "Bash(wmic process:*)",
+      "Bash(powershell -Command:*)",
+      "Bash(python3 -m json.tool:*)",
+      "Bash(npx vite build:*)",
+      "Bash(findstr:*)",
+      "Bash(timeout:*)",
+      "mcp__Claude_Preview__preview_start",
+      "Bash(python -c \"import sys,json; clients=json.load\\(sys.stdin\\); print\\(f''Total clients: {len\\(clients\\)}''\\); [print\\(f'' - {c[\"\"name\"\"]} \\({c[\"\"identifier\"\"]}\\)''\\) for c in clients]\")",
+      "Bash(python -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(f''Item: {d[\"\"name\"\"]}, Quantity after auto-adjust+checkout: {d[\"\"quantity\"\"]}''\\)\")",
+      "Bash(npx kill-port 5000)",
+      "Bash(where node.exe)",
+      "Bash(python -c \" import sys, json try: d = json.load\\(sys.stdin\\) if d.get\\(''foods''\\) and len\\(d[''foods'']\\) > 0: f = d[''foods''][0] print\\(f'' OK: {f.get\\(\"\"description\"\",\"\"?\"\"\\)} by {f.get\\(\"\"brandName\"\",\"\"?\"\"\\)}''\\) else: print\\(f'' MISS: totalHits={d.get\\(\"\"totalHits\"\",0\\)}''\\) except Exception as e: for line in sys.stdin: pass print\\(f'' ERROR: {e}''\\) \" echo \"\" echo \"=== 4. Nutritionix ===\" echo \" SKIPPED: Requires API keys \\(NUTRITIONIX_APP_ID + NUTRITIONIX_APP_KEY\\)\")",
+      "Bash(python -c \":*)",
+      "Bash(node -e \":*)",
+      "Bash(ipconfig)",
+      "Bash(npx ngrok --version)"
+    ]
+  }
+}
